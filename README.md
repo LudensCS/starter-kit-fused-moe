@@ -1,23 +1,20 @@
-FlashInfer AI Kernel Generation Contest @ MLSys 2026: Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
+# FlashInfer AI Kernel Generation Contest @ MLSys 2026
 
-<div align="center">
-  <table>
-    <tr>
-      <td align="center" width="25%">
-        <img src="images/nvidia-logo.svg" alt="NVIDIA" width="150"/>
-      </td>
-      <td align="center" width="25%">
-        <img src="images/modal-logo.png" alt="Modal" width="150"/>
-      </td>
-      <td align="center" width="25%">
-        <img src="images/mlsys-logo.svg" alt="MLSys" width="150"/>
-      </td>
-      <td align="center" width="25%">
-        <img src="images/flashinfer-logo.png" alt="FlashInfer" width="150"/>
-      </td>
-    </tr>
-  </table>
-</div>
+Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
+
+---
+
+<p align="center">
+  <a href="https://www.nvidia.com"><img src="images/nvidia-logo.svg" alt="NVIDIA" height="50"/></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://modal.com"><img src="images/modal-logo.png" alt="Modal" height="50"/></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://mlsys.org"><img src="images/mlsys-logo.svg" alt="MLSys" height="50"/></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://github.com/flashinfer-ai/flashinfer"><img src="images/flashinfer-logo.png" alt="FlashInfer" height="50"/></a>
+</p>
+
+---
 
 ## Quick Setup
 
