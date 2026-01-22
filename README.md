@@ -1,13 +1,25 @@
-# flashinfer-bench-starter-kit
-FlashInfer Bench @ MLSys 2026: Building AI agents to write high performance GPU kernels
+FlashInfer AI Kernel Generation Contest @ MLSys 2026: Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center" width="25%">
+        <img src="images/nvidia-logo.svg" alt="NVIDIA" width="150"/>
+      </td>
+      <td align="center" width="25%">
+        <img src="images/modal-logo.png" alt="Modal" width="150"/>
+      </td>
+      <td align="center" width="25%">
+        <img src="images/mlsys-logo.svg" alt="MLSys" width="150"/>
+      </td>
+      <td align="center" width="25%">
+        <img src="images/flashinfer-logo.png" alt="FlashInfer" width="150"/>
+      </td>
+    </tr>
+  </table>
+</div>
 
 ## Quick Setup
-
-### Prerequisites
-
-- Python 3.11+
-- For local execution: CUDA-capable GPU
-- For Modal execution: [Modal](https://modal.com) account
 
 ### Installation
 
@@ -50,3 +62,115 @@ modal volume put flashinfer-trace /path/to/flashinfer-trace
 ```
 
 This uploads the dataset to a persistent Modal Volume for fast access during benchmarks.
+
+## Running Benchmarks
+
+This starter kit includes two example scripts to help you benchmark your kernel solutions.
+
+**Note:** Edit the script to specify your solution path and configure benchmark parameters (warmup runs, iterations, trials).
+
+### Cloud Evaluation (`run_modal.py`)
+
+Run benchmarks on NVIDIA B200 GPUs in the cloud via Modal.
+
+**Requirements:**
+- Modal account (authenticated via `modal setup`)
+- Dataset uploaded to Modal Volume (see Modal Setup section above)
+
+**Usage:**
+
+```bash
+modal run run_modal.py
+```
+
+### Local Evaluation (`run_local.py`)
+
+Run benchmarks on your local GPU. This script loads a solution from a JSON file and evaluates it against all workloads in the dataset using your local CUDA-capable GPU.
+
+**Requirements:**
+- Local CUDA-capable GPU
+- `FIB_DATASET_PATH` environment variable set to your local dataset path
+
+**Usage:**
+
+```bash
+python run_local.py
+```
+
+## Additional Resources
+
+The `flashinfer_bench.agents` module provides tools to facilitate kernel development.
+
+### Solution Handling
+
+```python
+from flashinfer_bench import BuildSpec
+from flashinfer_bench.agents import pack_solution_from_files, extract_solution_to_files
+
+# Pack source files into a Solution object
+spec = BuildSpec(
+    language="triton",  # or "cuda"
+    target_hardware=["cuda"],
+    entry_point="my_kernel",
+)
+solution = pack_solution_from_files(
+    path="./my_solution_dir",
+    spec=spec,
+    name="my_solution_v1",
+    definition="rmsnorm",
+    author="your_name",
+)
+
+# Extract a Solution to files in a working directory
+extract_solution_to_files(solution, "./output_dir")
+```
+
+### Running Sanitizers
+
+```python
+from flashinfer_bench.agents import flashinfer_bench_run_sanitizer
+
+output = flashinfer_bench_run_sanitizer(
+    solution=solution,
+    workload=workload,
+    sanitizer_types=["memcheck", "racecheck", "synccheck", "initcheck"],
+    timeout=300,
+)
+print(output)
+```
+
+### NCU Profiling
+
+```python
+from flashinfer_bench.agents import flashinfer_bench_run_ncu
+
+output = flashinfer_bench_run_ncu(
+    solution=solution,
+    workload=workload,
+    set="detailed",
+    page="details",
+    timeout=120,
+)
+print(output)
+```
+
+### List Available Tools and Descriptions
+
+```python
+from flashinfer_bench.agents import get_all_tool_schemas
+
+schemas = get_all_tool_schemas()
+# Returns list of OpenAI-compatible function schemas
+```
+
+## Additional Notes
+
+### Kernel Signature Requirements
+
+When implementing kernels using Destination Passing Style (DPS), ensure you specify the kernel signature type in your `BuildSpec` and adjust the build configuration accordingly.
+
+**Important:** Avoid using variadic input arguments in your kernel signatures, as they will fail the builder validation check.
+
+### CUDA Kernel Bindings
+
+For CUDA kernel implementations, we recommend using [TVM FFI](https://tvm.apache.org/ffi/) for Python bindings. The `flashinfer_bench.agents` module provides TVM FFI agent instruction prompts to assist with development.
