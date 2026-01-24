@@ -1,3 +1,13 @@
+# FlashInfer Competition
+solution.json
+
+# CUDA build artifacts
+*.o
+*.obj
+*.cubin
+*.fatbin
+*.ptx
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

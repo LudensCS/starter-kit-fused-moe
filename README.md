@@ -16,9 +16,25 @@ Create high-performance GPU kernels for state-of-the-art LLM architectures on NV
 
 ---
 
-## Quick Setup
+## Competition Tracks
 
-### Installation
+The competition features three tracks, each targeting a critical LLM operation:
+
+| Track | Description |
+|-------|-------------|
+| **fused_moe** | Fused Mixture-of-Experts kernel for efficient expert routing and computation |
+| **sparse_attention** | Sparse attention mechanisms for long-context inference |
+| **gated_delta_net** | Gated delta network operations for efficient state updates |
+
+**Fork this template once per track** you want to compete in (separate repos for each track).
+
+## Getting Started
+
+### 1. Fork This Template
+
+Click "Use this template" or fork this repository to create your solution repo.
+
+### 2. Install Dependencies
 
 ```bash
 conda create -n fi-bench python=3.12
@@ -26,7 +42,7 @@ conda activate fi-bench
 pip install flashinfer-bench modal
 ```
 
-### Download the TraceSet
+### 3. Download the TraceSet
 
 Clone the competition dataset from HuggingFace:
 
@@ -35,72 +51,104 @@ git lfs install
 git clone https://huggingface.co/datasets/flashinfer-ai/flashinfer-trace
 ```
 
-This contains definitions, workloads, and reference solutions needed for benchmarking.
-
-Set the environment variable to point to the dataset:
+Set the environment variable:
 
 ```bash
 export FIB_DATASET_PATH=/path/to/flashinfer-trace
 ```
 
-### Modal Setup (for cloud GPU access)
+### 4. Configure Your Solution
 
-1. Authenticate with Modal:
+Edit `config.toml` to set your track and team info:
+
+```toml
+[solution]
+name = "my-team-solution-v1"      # Solution name
+definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
+author = "team-name"              # Team/author name
+
+[build]
+language = "triton"               # triton | cuda
+entry_point = "kernel"            # Kernel function name
+```
+
+### 5. Implement Your Kernel
+
+**For Triton:**
+Edit `solution/triton/kernel.py` with your implementation.
+
+**For CUDA:**
+Edit `solution/cuda/kernel.cu` and `solution/cuda/binding.py` with your implementation.
+
+## Development Workflow
+
+### Pack Your Solution
+
+Generate `solution.json` from your source files:
+
+```bash
+python scripts/pack_solution.py
+```
+
+### Run Local Benchmarks
+
+Test your solution on your local GPU:
+
+```bash
+python scripts/run_local.py
+```
+
+Requires: Local CUDA-capable GPU and `FIB_DATASET_PATH` environment variable.
+
+### Run Cloud Benchmarks (Modal)
+
+Test your solution on NVIDIA B200 GPUs via Modal:
+
+**One-time setup:**
 
 ```bash
 modal setup
-```
-
-2. Create a Modal Volume and upload the dataset (one-time setup):
-
-```bash
 modal volume create flashinfer-trace
 modal volume put flashinfer-trace /path/to/flashinfer-trace
 ```
 
-This uploads the dataset to a persistent Modal Volume for fast access during benchmarks.
-
-## Running Benchmarks
-
-This starter kit includes two example scripts to help you benchmark your kernel solutions.
-
-**Note:** Edit the script to specify your solution path and configure benchmark parameters (warmup runs, iterations, trials).
-
-### Cloud Evaluation (`run_modal.py`)
-
-Run benchmarks on NVIDIA B200 GPUs in the cloud via Modal.
-
-**Requirements:**
-
-- Modal account (authenticated via `modal setup`)
-- Dataset uploaded to Modal Volume (see Modal Setup section above)
-
-**Usage:**
+**Run benchmark:**
 
 ```bash
-modal run run_modal.py
+modal run scripts/run_modal.py
 ```
 
-### Local Evaluation (`run_local.py`)
+## Submission
 
-Run benchmarks on your local GPU. This script loads a solution from a JSON file and evaluates it against all workloads in the dataset using your local CUDA-capable GPU.
+To submit your solution for evaluation:
 
-**Requirements:**
+1. Ensure your implementation is complete and tested
+2. Run `python scripts/pack_solution.py` to generate `solution.json`
+3. Commit and push your changes
+4. Tag your commit for evaluation (e.g., `git tag submission-v1`)
 
-- Local CUDA-capable GPU
-- `FIB_DATASET_PATH` environment variable set to your local dataset path
+## Project Structure
 
-**Usage:**
-
-```bash
-python run_local.py
+```
+flashinfer-bench-starter-kit/
+├── README.md                    # This file
+├── config.toml                  # Track configuration (edit this)
+├── solution/                    # Solution source files
+│   ├── triton/                  # Triton implementation
+│   │   └── kernel.py           # Your Triton kernel
+│   └── cuda/                    # CUDA implementation
+│       ├── kernel.cu           # Your CUDA kernel
+│       └── binding.py          # TVM FFI bindings
+├── scripts/                     # Utility scripts
+│   ├── run_local.py            # Local benchmark runner
+│   ├── run_modal.py            # Modal cloud benchmark runner
+│   └── pack_solution.py        # Pack source files into solution.json
+└── images/                      # Sponsor logos
 ```
 
 ## Additional Resources
 
-The `flashinfer_bench.agents` module provides tools to facilitate kernel development.
-
-### Solution Handling
+### Solution Handling API
 
 ```python
 from flashinfer_bench import BuildSpec
@@ -116,7 +164,7 @@ solution = pack_solution_from_files(
     path="./my_solution_dir",
     spec=spec,
     name="my_solution_v1",
-    definition="rmsnorm",
+    definition="fused_moe",
     author="your_name",
 )
 
@@ -153,7 +201,7 @@ output = flashinfer_bench_run_ncu(
 print(output)
 ```
 
-### List Available Tools and Descriptions
+### List Available Tools
 
 ```python
 from flashinfer_bench.agents import get_all_tool_schemas
@@ -162,7 +210,7 @@ schemas = get_all_tool_schemas()
 # Returns list of OpenAI-compatible function schemas
 ```
 
-## Additional Notes
+## Notes
 
 ### Kernel Signature Requirements
 
