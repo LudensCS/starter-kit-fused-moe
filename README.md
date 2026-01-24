@@ -48,7 +48,7 @@ Clone the competition dataset from HuggingFace:
 
 ```bash
 git lfs install
-git clone https://huggingface.co/datasets/flashinfer-ai/flashinfer-trace
+git clone https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest
 ```
 
 Set the environment variable:
