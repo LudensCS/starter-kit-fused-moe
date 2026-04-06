@@ -1,9 +1,3 @@
-"""
-FlashInfer-Bench Profiling Runner.
-
-Runs NCU profiling on the solution.
-"""
-
 import argparse
 import json
 import os
@@ -16,7 +10,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from flashinfer_bench import Solution, TraceSet
-from flashinfer_bench.agents import flashinfer_bench_run_ncu
+from flashinfer_bench.agents import flashinfer_bench_run_sanitizer
 from scripts.pack_solution import pack_solution
 
 
@@ -40,7 +34,7 @@ def save_output(output: str, save_to_file: bool = False) -> None:
         
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = output_dir / f"profiling_{timestamp}.txt"
+        output_file = output_dir / f"sanitizer_{timestamp}.txt"
         
         # Write to file
         with open(output_file, "w") as f:
@@ -51,7 +45,7 @@ def save_output(output: str, save_to_file: bool = False) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run NCU profiling on the solution.")
+    parser = argparse.ArgumentParser(description="Run sanitizer checks on the solution.")
     parser.add_argument(
         "--save-to-file",
         action="store_true",
@@ -83,25 +77,22 @@ def main():
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
-    # Use the second workload for profiling (as in original)
-    workload = workloads[1].workload
+    # Use the first workload for sanitizer
+    workload = workloads[0].workload
 
     # Make paths absolute
     for input_name, input_spec in workload.inputs.items():
         if input_spec.type == 'safetensors':
             input_spec.path = os.path.join(trace_set_path, input_spec.path)
 
-    # Run NCU profiling
-    result = flashinfer_bench_run_ncu(
+    # Run sanitizer
+    output = flashinfer_bench_run_sanitizer(
         solution=solution,
         workload=workload,
-        trace_set_path=trace_set_path,
-        set="detailed",
-        #sections=["SpeedOfLight", "MemoryWorkloadAnalysis"],
-        page="details",
+        sanitizer_types=["memcheck", "racecheck", "synccheck", "initcheck"],
         timeout=3600,
     )
-    save_output(result, save_to_file=args.save_to_file)
+    save_output(output, save_to_file=args.save_to_file)
 
 
 if __name__ == "__main__":
