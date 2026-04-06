@@ -18,6 +18,8 @@ EPS = 1e-20
 
 _WEIGHT_CACHE_KEY = None
 _WEIGHT_CACHE_VALUE = None
+_GROUPED_WEIGHT_CACHE_KEY = None
+_GROUPED_WEIGHT_CACHE_VALUE = None
 
 
 @triton.jit
@@ -191,6 +193,25 @@ def _get_dequantized_weight_pack(
     return w13_t, w2_t
 
 
+def _get_grouped_weight_pack(
+    w13_t_all: torch.Tensor,
+    w2_t_all: torch.Tensor,
+    active_local_ids: torch.Tensor,
+):
+    global _GROUPED_WEIGHT_CACHE_KEY, _GROUPED_WEIGHT_CACHE_VALUE
+
+    active_ids_key = tuple(active_local_ids.tolist())
+    key = (_WEIGHT_CACHE_KEY, active_ids_key)
+    if _GROUPED_WEIGHT_CACHE_KEY == key and _GROUPED_WEIGHT_CACHE_VALUE is not None:
+        return _GROUPED_WEIGHT_CACHE_VALUE
+
+    w13_t = w13_t_all.index_select(0, active_local_ids).contiguous()
+    w2_t = w2_t_all.index_select(0, active_local_ids).contiguous()
+    _GROUPED_WEIGHT_CACHE_KEY = key
+    _GROUPED_WEIGHT_CACHE_VALUE = (w13_t, w2_t)
+    return w13_t, w2_t
+
+
 def _build_local_plan(
     routing_logits: torch.Tensor,
     routing_bias: torch.Tensor,
@@ -250,10 +271,11 @@ def _build_local_plan(
     expert_sorted = expert_flat[order]
     w_sorted = w_flat[order]
 
-    active_local_ids, counts = torch.unique_consecutive(expert_sorted, return_counts=True)
-    offs = counts.cumsum(0).to(dtype=torch.int32, device=logits.device).contiguous()
-
-    return token_sorted.contiguous(), w_sorted.contiguous(), active_local_ids.contiguous(), offs
+    return (
+        token_sorted.contiguous(),
+        w_sorted.contiguous(),
+        expert_sorted.contiguous(),
+    )
 
 
 @torch.no_grad()
@@ -334,7 +356,7 @@ def run(
     if plan is None:
         return output.to(torch.bfloat16).to(output_device)
 
-    token_sorted, w_sorted, active_local_ids, offs = plan
+    token_sorted, w_sorted, expert_sorted = plan
     a = _dequant_hidden_states(hidden_states, hidden_states_scale)
     a_cat = a.index_select(0, token_sorted).contiguous()
 
@@ -344,12 +366,13 @@ def run(
         gemm2_weights,
         gemm2_weights_scale,
     )
-    w13_t = w13_t_all.index_select(0, active_local_ids).contiguous()
-    w2_t = w2_t_all.index_select(0, active_local_ids).contiguous()
+    active_local_ids, counts = torch.unique_consecutive(expert_sorted, return_counts=True)
+    offs = counts.cumsum(0).to(dtype=torch.int32, device=routing_logits.device).contiguous()
+    w13_t, w2_t = _get_grouped_weight_pack(w13_t_all, w2_t_all, active_local_ids)
 
     g1 = torch.ops.aten._grouped_mm(a_cat, w13_t, offs)
     c = _swiglu_triton(g1)
     o = torch.ops.aten._grouped_mm(c, w2_t, offs)
-
     output.index_add_(0, token_sorted, o.to(torch.float32) * w_sorted.unsqueeze(1))
+
     return output.to(torch.bfloat16).to(output_device)
