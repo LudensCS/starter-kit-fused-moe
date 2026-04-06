@@ -1,445 +1,227 @@
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-
-BLOCK_Q = 128
-H_CONST = 7168
-I_CONST = 2048
-GEMM1_OUT_CONST = 4096
-E_GLOBAL_CONST = 256
-E_LOCAL_CONST = 32
-N_GROUP_CONST = 8
-TOPK_GROUP_CONST = 4
-TOP_K_CONST = 8
-
-NUM_HIDDEN_BLOCKS = H_CONST // BLOCK_Q
-NUM_INTERMEDIATE_BLOCKS = I_CONST // BLOCK_Q
-NUM_GEMM1_OUT_BLOCKS = GEMM1_OUT_CONST // BLOCK_Q
-
+BLOCK_M = 128
+BLOCK_N = 128
+BLOCK_K = 32
 
 @triton.jit
-def _dequant_hidden_selected_kernel(
-    x_ptr,
-    scale_ptr,
-    row_idx_ptr,
-    out_ptr,
-    stride_x_t,
-    stride_x_h,
-    stride_s_b,
-    stride_s_t,
-    stride_r,
-    stride_o_t,
-    stride_o_h,
-    n_rows,
-    H,
-    BLOCK_H: tl.constexpr,
-):
-    pid_row = tl.program_id(0)
-    pid_blk = tl.program_id(1)
-
-    if pid_row >= n_rows:
-        return
-
-    src_row = tl.load(row_idx_ptr + pid_row * stride_r)
-    offs_h = pid_blk * BLOCK_H + tl.arange(0, BLOCK_H)
-    mask_h = offs_h < H
-
-    x = tl.load(
-        x_ptr + src_row * stride_x_t + offs_h * stride_x_h,
-        mask=mask_h,
-        other=0.0,
-    ).to(tl.float32)
-    s = tl.load(
-        scale_ptr + pid_blk * stride_s_b + src_row * stride_s_t
-    ).to(tl.float32)
-    y = x * s
-    tl.store(
-        out_ptr + pid_row * stride_o_t + offs_h * stride_o_h,
-        y,
-        mask=mask_h,
-    )
-
-
-@triton.jit
-def _dequant_single_expert_weight_kernel(
-    w_ptr,
-    s_ptr,
-    out_ptr,
-    expert_idx,
-    stride_w_e,
-    stride_w_m,
-    stride_w_k,
-    stride_s_e,
-    stride_s_mb,
-    stride_s_kb,
-    stride_o_m,
-    stride_o_k,
+def _matmul_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
     M,
+    N,
     K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
     BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    pid_mb = tl.program_id(0)
-    pid_kb = tl.program_id(1)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    offs_m = pid_mb * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_k = pid_kb * BLOCK_K + tl.arange(0, BLOCK_K)
-    mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    w = tl.load(
-        w_ptr + expert_idx * stride_w_e + offs_m[:, None] * stride_w_m + offs_k[None, :] * stride_w_k,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    s = tl.load(
-        s_ptr + expert_idx * stride_s_e + pid_mb * stride_s_mb + pid_kb * stride_s_kb
-    ).to(tl.float32)
-    y = w * s
-    tl.store(
-        out_ptr + offs_m[:, None] * stride_o_m + offs_k[None, :] * stride_o_k,
-        y,
-        mask=mask,
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b)
+
+    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def _triton_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    assert A.dtype == torch.float32 and B.dtype == torch.float32
+    assert A.device == B.device
+    M, K = A.shape
+    Kb, N = B.shape
+    assert K == Kb, 'Incompatible matmul dimensions'
+
+    C = torch.empty((M, N), dtype=torch.float32, device=A.device)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _matmul_kernel[grid](
+        A,
+        B,
+        C,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        C.stride(0),
+        C.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
+    return C
 
 
-def _ensure_cuda_available():
+def _to_cuda_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type == 'cuda':
+        return tensor
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for this Triton implementation, but CUDA is not available.")
+        raise RuntimeError('CUDA is required to run the Triton MoE kernel.')
+    return tensor.cuda()
 
 
-def _infer_primary_device(*args, **kwargs):
-    for x in list(args) + list(kwargs.values()):
-        if isinstance(x, torch.Tensor):
-            return x.device
-    return torch.device("cpu")
-
-
-def _move_to_device(x, device):
-    if isinstance(x, torch.Tensor):
-        return x if x.device == device else x.to(device)
+def _ensure_tensor(x, name: str):
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f'{name} must be a torch.Tensor')
     return x
 
 
-def _prepare_inputs(named_inputs, device):
-    out = {}
-    for k, v in named_inputs.items():
-        out[k] = _move_to_device(v, device) if isinstance(v, torch.Tensor) else v
-    return out
+def _expand_scale(scale: torch.Tensor, repeat_dim1: int, repeat_dim2: int) -> torch.Tensor:
+    return scale.to(torch.float32).repeat_interleave(repeat_dim1, dim=1).repeat_interleave(repeat_dim2, dim=2)
 
 
-def _validate_shapes(
-    routing_logits,
-    routing_bias,
-    hidden_states,
-    hidden_states_scale,
-    gemm1_weights,
-    gemm1_weights_scale,
-    gemm2_weights,
-    gemm2_weights_scale,
-):
-    if routing_logits.ndim != 2:
-        raise ValueError(f"routing_logits must be 2D, got ndim={routing_logits.ndim}")
-    T = routing_logits.shape[0]
-
-    if tuple(routing_logits.shape) != (T, E_GLOBAL_CONST):
-        raise ValueError(f"routing_logits must have shape ({T}, {E_GLOBAL_CONST}), got {tuple(routing_logits.shape)}")
-    if routing_bias.shape[-1] != E_GLOBAL_CONST:
-        raise ValueError(f"routing_bias last dim must be {E_GLOBAL_CONST}, got {routing_bias.shape[-1]}")
-    if tuple(hidden_states.shape) != (T, H_CONST):
-        raise ValueError(f"hidden_states must have shape ({T}, {H_CONST}), got {tuple(hidden_states.shape)}")
-    if tuple(hidden_states_scale.shape) != (NUM_HIDDEN_BLOCKS, T):
-        raise ValueError(
-            f"hidden_states_scale must have shape ({NUM_HIDDEN_BLOCKS}, {T}), got {tuple(hidden_states_scale.shape)}"
-        )
-    if tuple(gemm1_weights.shape) != (E_LOCAL_CONST, GEMM1_OUT_CONST, H_CONST):
-        raise ValueError(
-            f"gemm1_weights must have shape ({E_LOCAL_CONST}, {GEMM1_OUT_CONST}, {H_CONST}), got {tuple(gemm1_weights.shape)}"
-        )
-    if tuple(gemm1_weights_scale.shape) != (E_LOCAL_CONST, NUM_GEMM1_OUT_BLOCKS, NUM_HIDDEN_BLOCKS):
-        raise ValueError(
-            f"gemm1_weights_scale must have shape ({E_LOCAL_CONST}, {NUM_GEMM1_OUT_BLOCKS}, {NUM_HIDDEN_BLOCKS}), got {tuple(gemm1_weights_scale.shape)}"
-        )
-    if tuple(gemm2_weights.shape) != (E_LOCAL_CONST, H_CONST, I_CONST):
-        raise ValueError(
-            f"gemm2_weights must have shape ({E_LOCAL_CONST}, {H_CONST}, {I_CONST}), got {tuple(gemm2_weights.shape)}"
-        )
-    if tuple(gemm2_weights_scale.shape) != (E_LOCAL_CONST, NUM_HIDDEN_BLOCKS, NUM_INTERMEDIATE_BLOCKS):
-        raise ValueError(
-            f"gemm2_weights_scale must have shape ({E_LOCAL_CONST}, {NUM_HIDDEN_BLOCKS}, {NUM_INTERMEDIATE_BLOCKS}), got {tuple(gemm2_weights_scale.shape)}"
-        )
-
-
-def _dequant_hidden_selected_triton(hidden_states, hidden_states_scale, row_idx):
-    n_rows = int(row_idx.numel())
-    out = torch.empty((n_rows, H_CONST), device=hidden_states.device, dtype=torch.float32)
-    if n_rows == 0:
-        return out
-
-    x = hidden_states.contiguous()
-    s = hidden_states_scale.contiguous()
-    row_idx = row_idx.contiguous()
-
-    grid = (n_rows, NUM_HIDDEN_BLOCKS)
-    _dequant_hidden_selected_kernel[grid](
-        x,
-        s,
-        row_idx,
-        out,
-        x.stride(0),
-        x.stride(1),
-        s.stride(0),
-        s.stride(1),
-        row_idx.stride(0),
-        out.stride(0),
-        out.stride(1),
-        n_rows,
-        H_CONST,
-        BLOCK_H=BLOCK_Q,
-        num_warps=4,
-        num_stages=2,
-    )
-    return out
-
-
-def _dequant_single_w13_triton(gemm1_weights, gemm1_weights_scale, local_expert_idx):
-    out = torch.empty((GEMM1_OUT_CONST, H_CONST), device=gemm1_weights.device, dtype=torch.float32)
-    w = gemm1_weights.contiguous()
-    s = gemm1_weights_scale.contiguous()
-
-    grid = (NUM_GEMM1_OUT_BLOCKS, NUM_HIDDEN_BLOCKS)
-    _dequant_single_expert_weight_kernel[grid](
-        w,
-        s,
-        out,
-        int(local_expert_idx),
-        w.stride(0),
-        w.stride(1),
-        w.stride(2),
-        s.stride(0),
-        s.stride(1),
-        s.stride(2),
-        out.stride(0),
-        out.stride(1),
-        GEMM1_OUT_CONST,
-        H_CONST,
-        BLOCK_M=BLOCK_Q,
-        BLOCK_K=BLOCK_Q,
-        num_warps=4,
-        num_stages=2,
-    )
-    return out
-
-
-def _dequant_single_w2_triton(gemm2_weights, gemm2_weights_scale, local_expert_idx):
-    out = torch.empty((H_CONST, I_CONST), device=gemm2_weights.device, dtype=torch.float32)
-    w = gemm2_weights.contiguous()
-    s = gemm2_weights_scale.contiguous()
-
-    grid = (NUM_HIDDEN_BLOCKS, NUM_INTERMEDIATE_BLOCKS)
-    _dequant_single_expert_weight_kernel[grid](
-        w,
-        s,
-        out,
-        int(local_expert_idx),
-        w.stride(0),
-        w.stride(1),
-        w.stride(2),
-        s.stride(0),
-        s.stride(1),
-        s.stride(2),
-        out.stride(0),
-        out.stride(1),
-        H_CONST,
-        I_CONST,
-        BLOCK_M=BLOCK_Q,
-        BLOCK_K=BLOCK_Q,
-        num_warps=4,
-        num_stages=2,
-    )
-    return out
-
-
-def _route_local_compact(
-    routing_logits,
-    routing_bias,
-    local_expert_offset,
-    routed_scaling_factor,
-):
-    logits = routing_logits.to(torch.float32)
-    bias = routing_bias.to(torch.float32).reshape(-1)
-
-    s = torch.sigmoid(logits)
-    s_with_bias = s + bias
-
-    group_size = E_GLOBAL_CONST // N_GROUP_CONST
-    grouped = s_with_bias.view(-1, N_GROUP_CONST, group_size)
-
-    top2_vals, _ = torch.topk(grouped, k=2, dim=2, largest=True, sorted=False)
-    group_scores = top2_vals.sum(dim=2)
-
-    _, group_idx = torch.topk(group_scores, k=TOPK_GROUP_CONST, dim=1, largest=True, sorted=False)
-    group_mask = torch.zeros_like(group_scores)
-    group_mask.scatter_(1, group_idx, 1.0)
-
-    score_mask = group_mask.unsqueeze(2).expand(-1, N_GROUP_CONST, group_size).reshape(-1, E_GLOBAL_CONST)
-    neg_inf = torch.finfo(torch.float32).min
-    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
-
-    _, topk_idx = torch.topk(scores_pruned, k=TOP_K_CONST, dim=1, largest=True, sorted=False)
-
-    topk_s = s.gather(1, topk_idx)
-    topk_s_sum = topk_s.sum(dim=1, keepdim=True) + 1.0e-20
-    topk_weights = (topk_s / topk_s_sum) * float(routed_scaling_factor)
-
-    device = routing_logits.device
-    topk_local = topk_idx - int(local_expert_offset)
-    valid_slot = (topk_local >= 0) & (topk_local < E_LOCAL_CONST)
-
-    if not bool(valid_slot.any().item()):
-        empty = torch.empty((0,), device=device, dtype=torch.int64)
-        return empty, {}, []
-
-    token_grid = torch.arange(topk_idx.shape[0], device=device, dtype=torch.int64).unsqueeze(1).expand(-1, TOP_K_CONST)
-    pair_token_idx = token_grid[valid_slot]
-    pair_local_idx = topk_local[valid_slot].to(torch.int64)
-    pair_weight = topk_weights[valid_slot]
-
-    order = torch.argsort(pair_local_idx)
-    pair_token_idx = pair_token_idx[order]
-    pair_local_idx = pair_local_idx[order]
-    pair_weight = pair_weight[order]
-
-    counts = torch.bincount(pair_local_idx, minlength=E_LOCAL_CONST)
-    active_local = torch.nonzero(counts > 0, as_tuple=False).squeeze(1)
-    selected_rows = torch.unique(pair_token_idx, sorted=True)
-
-    expert_data = {}
-    start = 0
-    for le in active_local.tolist():
-        cnt = int(counts[le].item())
-        end = start + cnt
-        expert_data[int(le)] = (pair_token_idx[start:end], pair_weight[start:end])
-        start = end
-
-    return selected_rows, expert_data, active_local.tolist()
+def _expand_hidden_scale(hidden_states_scale: torch.Tensor, block_size: int) -> torch.Tensor:
+    return hidden_states_scale.to(torch.float32).permute(1, 0).contiguous().repeat_interleave(block_size, dim=1)
 
 
 @torch.no_grad()
-def run(*args, **kwargs):
-    _ensure_cuda_available()
+def run(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    local_expert_offset: int,
+    routed_scaling_factor: float,
+):
+    H = 7168
+    I = 2048
+    E_global = 256
+    E_local = gemm1_weights.shape[0]
+    BLOCK = 128
 
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
-
-    arg_names = [
-        "routing_logits",
-        "routing_bias",
-        "hidden_states",
-        "hidden_states_scale",
-        "gemm1_weights",
-        "gemm1_weights_scale",
-        "gemm2_weights",
-        "gemm2_weights_scale",
-        "local_expert_offset",
-        "routed_scaling_factor",
-    ]
-
-    values = {}
-    for i, name in enumerate(arg_names):
-        if i < len(args):
-            values[name] = args[i]
-        elif name in kwargs:
-            values[name] = kwargs[name]
-        else:
-            raise TypeError(f"Missing required argument: {name}")
-
-    original_device = _infer_primary_device(*args, **kwargs)
-    cuda_device = torch.device("cuda")
-    prepared = _prepare_inputs(values, cuda_device)
-
-    routing_logits = prepared["routing_logits"]
-    routing_bias = prepared["routing_bias"]
-    hidden_states = prepared["hidden_states"]
-    hidden_states_scale = prepared["hidden_states_scale"]
-    gemm1_weights = prepared["gemm1_weights"]
-    gemm1_weights_scale = prepared["gemm1_weights_scale"]
-    gemm2_weights = prepared["gemm2_weights"]
-    gemm2_weights_scale = prepared["gemm2_weights_scale"]
-    local_expert_offset = int(prepared["local_expert_offset"])
-    routed_scaling_factor = float(prepared["routed_scaling_factor"])
-
-    if routing_logits.device.type != "cuda":
-        raise RuntimeError("routing_logits must be on CUDA after device preparation.")
-    if hidden_states.device.type != "cuda":
-        raise RuntimeError("hidden_states must be on CUDA after device preparation.")
-
-    _validate_shapes(
-        routing_logits,
-        routing_bias,
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm2_weights,
-        gemm2_weights_scale,
-    )
+    assert H == 7168, 'hidden_size must be 7168'
+    assert I == 2048, 'intermediate_size must be 2048'
+    assert E_global == 256, 'num_experts must be 256'
+    assert E_local == 32, 'num_local_experts must be 32'
 
     T = routing_logits.shape[0]
-    device = hidden_states.device
-    output = torch.zeros((T, H_CONST), dtype=torch.float32, device=device)
+    assert hidden_states.shape == (T, H)
+    assert hidden_states_scale.shape == (H // BLOCK, T)
+    assert gemm1_weights.shape == (E_local, 2 * I, H)
+    assert gemm1_weights_scale.shape == (E_local, (2 * I) // BLOCK, H // BLOCK)
+    assert gemm2_weights.shape == (E_local, H, I)
+    assert gemm2_weights_scale.shape == (E_local, H // BLOCK, I // BLOCK)
+    assert routing_bias is None or routing_bias.shape[-1] == E_global
 
-    selected_rows, expert_data, active_local = _route_local_compact(
-        routing_logits,
-        routing_bias,
-        local_expert_offset,
-        routed_scaling_factor,
+    if isinstance(local_expert_offset, torch.Tensor):
+        local_expert_offset = int(local_expert_offset.item())
+    else:
+        local_expert_offset = int(local_expert_offset)
+    if isinstance(routed_scaling_factor, torch.Tensor):
+        routed_scaling_factor = float(routed_scaling_factor.item())
+    else:
+        routed_scaling_factor = float(routed_scaling_factor)
+
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA is required to run the Triton MoE kernel.')
+
+    original_device = hidden_states.device
+    device = torch.device('cuda')
+
+    routing_logits = _to_cuda_tensor(_ensure_tensor(routing_logits, 'routing_logits'))
+    hidden_states = _to_cuda_tensor(_ensure_tensor(hidden_states, 'hidden_states'))
+    hidden_states_scale = _to_cuda_tensor(
+        _ensure_tensor(hidden_states_scale, 'hidden_states_scale')
     )
+    gemm1_weights = _to_cuda_tensor(_ensure_tensor(gemm1_weights, 'gemm1_weights'))
+    gemm1_weights_scale = _to_cuda_tensor(
+        _ensure_tensor(gemm1_weights_scale, 'gemm1_weights_scale')
+    )
+    gemm2_weights = _to_cuda_tensor(_ensure_tensor(gemm2_weights, 'gemm2_weights'))
+    gemm2_weights_scale = _to_cuda_tensor(
+        _ensure_tensor(gemm2_weights_scale, 'gemm2_weights_scale')
+    )
+    if routing_bias is not None:
+        routing_bias = _to_cuda_tensor(_ensure_tensor(routing_bias, 'routing_bias'))
 
-    if selected_rows.numel() == 0 or len(active_local) == 0:
-        result = output.to(torch.bfloat16)
-        if original_device.type != "cuda":
-            result = result.to(original_device)
-        return result
+    hidden_states = hidden_states.contiguous()
+    routing_logits = routing_logits.contiguous()
+    hidden_states_scale = hidden_states_scale.contiguous()
+    gemm1_weights = gemm1_weights.contiguous()
+    gemm1_weights_scale = gemm1_weights_scale.contiguous()
+    gemm2_weights = gemm2_weights.contiguous()
+    gemm2_weights_scale = gemm2_weights_scale.contiguous()
 
-    A_sel = _dequant_hidden_selected_triton(hidden_states, hidden_states_scale, selected_rows)
+    A_scale = _expand_hidden_scale(hidden_states_scale, BLOCK)
+    A = hidden_states.to(torch.float32) * A_scale
 
-    pos_map = torch.full((T,), -1, device=device, dtype=torch.int64)
-    pos_map[selected_rows] = torch.arange(selected_rows.numel(), device=device, dtype=torch.int64)
+    W13 = gemm1_weights.to(torch.float32) * _expand_scale(gemm1_weights_scale, BLOCK, BLOCK)
+    W2 = gemm2_weights.to(torch.float32) * _expand_scale(gemm2_weights_scale, BLOCK, BLOCK)
 
-    w13_cache = {}
-    w2_cache = {}
+    logits = routing_logits.to(torch.float32)
+    bias = None if routing_bias is None else routing_bias.to(torch.float32).reshape(-1)
+    s = torch.sigmoid(logits + bias if bias is not None else logits)
+    s_with_bias = s
 
-    for le in active_local:
-        token_idx, w_tok = expert_data[le]
-        if token_idx.numel() == 0:
+    group_size = E_global // 8
+    s_wb_grouped = s_with_bias.view(T, 8, group_size)
+    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)
+    group_scores = top2_vals.sum(dim=2)
+    _, group_idx = torch.topk(group_scores, k=4, dim=1, largest=True, sorted=False)
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1.0)
+    score_mask = group_mask.unsqueeze(2).expand(T, 8, group_size).reshape(T, E_global)
+    neg_inf = torch.finfo(torch.float32).min
+    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
+    _, topk_idx = torch.topk(scores_pruned, k=8, dim=1, largest=True, sorted=False)
+    M = torch.zeros_like(s)
+    M.scatter_(1, topk_idx, 1.0)
+    weights = s * M
+    weights_sum = weights.sum(dim=1, keepdim=True).clamp_min(1e-20)
+    weights = (weights / weights_sum) * routed_scaling_factor
+
+    local_start = local_expert_offset
+    local_end = local_start + E_local
+    expert_weights = weights[:, local_start:local_end]
+
+    output = torch.zeros((T, H), dtype=torch.float32, device=device)
+    for expert_idx in range(E_local):
+        gate = expert_weights[:, expert_idx : expert_idx + 1]
+        if gate.abs().max() == 0.0:
             continue
 
-        gathered_pos = pos_map[token_idx]
-        A_e = A_sel.index_select(0, gathered_pos)
+        W13_e = W13[expert_idx]
+        W2_e = W2[expert_idx]
+        hidden_proj = torch.matmul(A, W13_e.t())
+        x1 = hidden_proj[:, :I]
+        x2 = hidden_proj[:, I:]
+        activated = x1 * torch.sigmoid(x2)
+        expert_output = torch.matmul(activated, W2_e.t())
+        output += expert_output * gate
 
-        W13_e = w13_cache.get(le)
-        if W13_e is None:
-            W13_e = _dequant_single_w13_triton(gemm1_weights, gemm1_weights_scale, le)
-            w13_cache[le] = W13_e
-
-        W2_e = w2_cache.get(le)
-        if W2_e is None:
-            W2_e = _dequant_single_w2_triton(gemm2_weights, gemm2_weights_scale, le)
-            w2_cache[le] = W2_e
-
-        G1 = torch.matmul(A_e, W13_e.transpose(0, 1))
-        X1 = G1[:, :I_CONST]
-        X2 = G1[:, I_CONST:]
-        C = X1 * F.silu(X2)
-        O = torch.matmul(C, W2_e.transpose(0, 1))
-
-        output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
-
-    result = output.to(torch.bfloat16)
-    if original_device.type != "cuda":
-        result = result.to(original_device)
-    return result
+    return output.to(torch.bfloat16).to(original_device)

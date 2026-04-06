@@ -68,7 +68,7 @@ Return ONLY the full, complete, and runnable Python code for `solutions/triton/k
 additional:虽然baseline调用的flashinfer库实现你不能直接调用，但是你可以溯源baseline到flashinfer库（本地安装）去查看它的具体实现来参考。
 
 ## pytorch reference:
-"
+```python
 import torch
 
 
@@ -237,4 +237,4 @@ def run(
         output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))  # [Tk,H] * [Tk,1]
 
     return output.to(torch.bfloat16)
-"
+```
