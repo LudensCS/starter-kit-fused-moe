@@ -16,6 +16,9 @@ NUM_GEMM1_OUT_BLOCKS = (2 * INTERMEDIATE_SIZE) // BLOCK_SIZE
 EXPERTS_PER_GROUP = NUM_EXPERTS_GLOBAL // N_GROUP
 EPS = 1e-20
 
+_WEIGHT_CACHE_KEY = None
+_WEIGHT_CACHE_VALUE = None
+
 
 @triton.jit
 def _swiglu_kernel(
@@ -31,7 +34,6 @@ def _swiglu_kernel(
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = (pid_m < rows) & (offs_n < I)
 
@@ -43,9 +45,7 @@ def _swiglu_kernel(
     )
     x1 = x1.to(tl.float32)
     x2 = x2.to(tl.float32)
-
-    sigmoid_x2 = 1.0 / (1.0 + tl.exp(-x2))
-    y = x1 * (x2 * sigmoid_x2)
+    y = x1 * (x2 / (1.0 + tl.exp(-x2)))
     tl.store(
         c_ptr + pid_m * stride_cm + offs_n * stride_cn,
         y.to(tl.bfloat16),
@@ -79,6 +79,18 @@ def _normalize_float_scalar(x) -> float:
     if isinstance(x, torch.Tensor):
         return float(x.item())
     return float(x)
+
+
+def _tensor_cache_key(t: torch.Tensor):
+    return (
+        int(t.data_ptr()),
+        tuple(t.shape),
+        tuple(t.stride()),
+        t.dtype,
+        t.device.type,
+        t.device.index,
+        int(t._version),
+    )
 
 
 def _swiglu_triton(g1: torch.Tensor) -> torch.Tensor:
@@ -115,36 +127,133 @@ def _dequant_hidden_states(
     return (a * s).view(t, HIDDEN_SIZE).to(torch.bfloat16)
 
 
-def _dequant_w13(
-    w13_q: torch.Tensor,
-    w13_scale: torch.Tensor,
+def _dequant_all_w13_t(
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
 ) -> torch.Tensor:
-    w = w13_q.to(torch.float32).view(
+    w = gemm1_weights.to(torch.float32).view(
+        NUM_LOCAL_EXPERTS,
         NUM_GEMM1_OUT_BLOCKS,
         BLOCK_SIZE,
         NUM_HIDDEN_BLOCKS,
         BLOCK_SIZE,
     )
-    s = w13_scale.to(torch.float32).view(NUM_GEMM1_OUT_BLOCKS, NUM_HIDDEN_BLOCKS)
-    return (w * s[:, None, :, None]).view(2 * INTERMEDIATE_SIZE, HIDDEN_SIZE).to(
-        torch.bfloat16
+    s = gemm1_weights_scale.to(torch.float32).view(
+        NUM_LOCAL_EXPERTS,
+        NUM_GEMM1_OUT_BLOCKS,
+        NUM_HIDDEN_BLOCKS,
     )
+    deq = (w * s[:, :, None, :, None]).view(NUM_LOCAL_EXPERTS, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE)
+    return deq.transpose(1, 2).contiguous().to(torch.bfloat16)
 
 
-def _dequant_w2(
-    w2_q: torch.Tensor,
-    w2_scale: torch.Tensor,
+def _dequant_all_w2_t(
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
 ) -> torch.Tensor:
-    w = w2_q.to(torch.float32).view(
+    w = gemm2_weights.to(torch.float32).view(
+        NUM_LOCAL_EXPERTS,
         NUM_HIDDEN_BLOCKS,
         BLOCK_SIZE,
         NUM_INTERMEDIATE_BLOCKS,
         BLOCK_SIZE,
     )
-    s = w2_scale.to(torch.float32).view(NUM_HIDDEN_BLOCKS, NUM_INTERMEDIATE_BLOCKS)
-    return (w * s[:, None, :, None]).view(HIDDEN_SIZE, INTERMEDIATE_SIZE).to(
-        torch.bfloat16
+    s = gemm2_weights_scale.to(torch.float32).view(
+        NUM_LOCAL_EXPERTS,
+        NUM_HIDDEN_BLOCKS,
+        NUM_INTERMEDIATE_BLOCKS,
     )
+    deq = (w * s[:, :, None, :, None]).view(NUM_LOCAL_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+    return deq.transpose(1, 2).contiguous().to(torch.bfloat16)
+
+
+def _get_dequantized_weight_pack(
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+):
+    global _WEIGHT_CACHE_KEY, _WEIGHT_CACHE_VALUE
+
+    key = (
+        _tensor_cache_key(gemm1_weights),
+        _tensor_cache_key(gemm1_weights_scale),
+        _tensor_cache_key(gemm2_weights),
+        _tensor_cache_key(gemm2_weights_scale),
+    )
+    if _WEIGHT_CACHE_KEY == key and _WEIGHT_CACHE_VALUE is not None:
+        return _WEIGHT_CACHE_VALUE
+
+    w13_t = _dequant_all_w13_t(gemm1_weights, gemm1_weights_scale)
+    w2_t = _dequant_all_w2_t(gemm2_weights, gemm2_weights_scale)
+    _WEIGHT_CACHE_KEY = key
+    _WEIGHT_CACHE_VALUE = (w13_t, w2_t)
+    return w13_t, w2_t
+
+
+def _build_local_plan(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    local_start: int,
+    routed_scaling_factor: float,
+):
+    seq_len = routing_logits.shape[0]
+    logits = routing_logits.to(torch.float32)
+    bias = (
+        torch.zeros((1, NUM_EXPERTS_GLOBAL), dtype=torch.float32, device=logits.device)
+        if routing_bias is None
+        else routing_bias.to(torch.float32).reshape(1, NUM_EXPERTS_GLOBAL)
+    )
+
+    s = torch.sigmoid(logits)
+    s_with_bias = s + bias
+
+    grouped_scores = s_with_bias.view(seq_len, N_GROUP, EXPERTS_PER_GROUP)
+    top2_vals = torch.topk(grouped_scores, k=2, dim=2, largest=True, sorted=False).values
+    group_scores = top2_vals.sum(dim=2)
+    top_group_idx = torch.topk(
+        group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False
+    ).indices
+
+    group_mask = torch.zeros((seq_len, N_GROUP), dtype=torch.bool, device=logits.device)
+    group_mask.scatter_(1, top_group_idx, True)
+    expert_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(seq_len, N_GROUP, EXPERTS_PER_GROUP)
+        .reshape(seq_len, NUM_EXPERTS_GLOBAL)
+    )
+
+    min_float = torch.finfo(torch.float32).min
+    pruned_scores = s_with_bias.masked_fill(~expert_mask, min_float)
+    topk_idx = torch.topk(pruned_scores, k=TOP_K, dim=1, largest=True, sorted=False).indices
+
+    topk_s = torch.gather(s, 1, topk_idx)
+    topk_weights = (topk_s / (topk_s.sum(dim=1, keepdim=True) + EPS)) * routed_scaling_factor
+
+    local_idx = topk_idx - local_start
+    local_mask = (local_idx >= 0) & (local_idx < NUM_LOCAL_EXPERTS)
+    if not bool(local_mask.any()):
+        return None
+
+    token_idx = (
+        torch.arange(seq_len, device=logits.device, dtype=torch.int64)
+        .unsqueeze(1)
+        .expand(seq_len, TOP_K)
+    )
+
+    token_flat = token_idx[local_mask]
+    expert_flat = local_idx[local_mask].to(torch.int64)
+    w_flat = topk_weights[local_mask].to(torch.float32)
+
+    order = torch.argsort(expert_flat, stable=True)
+    token_sorted = token_flat[order]
+    expert_sorted = expert_flat[order]
+    w_sorted = w_flat[order]
+
+    active_local_ids, counts = torch.unique_consecutive(expert_sorted, return_counts=True)
+    offs = counts.cumsum(0).to(dtype=torch.int32, device=logits.device).contiguous()
+
+    return token_sorted.contiguous(), w_sorted.contiguous(), active_local_ids.contiguous(), offs
 
 
 @torch.no_grad()
@@ -212,99 +321,35 @@ def run(
     )
     assert routing_bias is None or routing_bias.shape[-1] == NUM_EXPERTS_GLOBAL
 
-    logits = routing_logits.to(torch.float32)
-    bias = (
-        torch.zeros((1, NUM_EXPERTS_GLOBAL), dtype=torch.float32, device=logits.device)
-        if routing_bias is None
-        else routing_bias.to(torch.float32).reshape(1, NUM_EXPERTS_GLOBAL)
+    output = torch.zeros(
+        (seq_len, HIDDEN_SIZE), dtype=torch.float32, device=routing_logits.device
     )
 
-    s = torch.sigmoid(logits)
-    s_with_bias = s + bias
-
-    grouped_scores = s_with_bias.view(seq_len, N_GROUP, EXPERTS_PER_GROUP)
-    top2_vals = torch.topk(grouped_scores, k=2, dim=2, largest=True, sorted=False).values
-    group_scores = top2_vals.sum(dim=2)
-    top_group_idx = torch.topk(
-        group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False
-    ).indices
-
-    group_mask = torch.zeros(
-        (seq_len, N_GROUP), dtype=torch.bool, device=logits.device
+    plan = _build_local_plan(
+        routing_logits,
+        routing_bias,
+        local_expert_offset,
+        routed_scaling_factor,
     )
-    group_mask.scatter_(1, top_group_idx, True)
-    expert_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(seq_len, N_GROUP, EXPERTS_PER_GROUP)
-        .reshape(seq_len, NUM_EXPERTS_GLOBAL)
-    )
-
-    min_float = torch.finfo(torch.float32).min
-    pruned_scores = s_with_bias.masked_fill(~expert_mask, min_float)
-    topk_idx = torch.topk(pruned_scores, k=TOP_K, dim=1, largest=True, sorted=False).indices
-
-    topk_s = torch.gather(s, 1, topk_idx)
-    topk_weights = topk_s / (topk_s.sum(dim=1, keepdim=True) + EPS)
-    topk_weights = topk_weights * routed_scaling_factor
-
-    output = torch.zeros((seq_len, HIDDEN_SIZE), dtype=torch.float32, device=logits.device)
-
-    local_start = local_expert_offset
-    local_end = local_start + NUM_LOCAL_EXPERTS
-
-    local_pick_mask = (topk_idx >= local_start) & (topk_idx < local_end)
-    if not local_pick_mask.any():
+    if plan is None:
         return output.to(torch.bfloat16).to(output_device)
 
-    token_ids = (
-        torch.arange(seq_len, device=logits.device, dtype=torch.int64)
-        .unsqueeze(1)
-        .expand(seq_len, TOP_K)
-        .reshape(-1)
-    )
-    flat_mask = local_pick_mask.reshape(-1)
-    flat_topk_idx = topk_idx.reshape(-1)
-    flat_topk_weights = topk_weights.reshape(-1)
-
-    selected_tokens = token_ids[flat_mask]
-    selected_local_experts = (flat_topk_idx[flat_mask] - local_start).to(torch.int64)
-    selected_weights = flat_topk_weights[flat_mask].to(torch.float32)
-
-    sort_order = torch.argsort(selected_local_experts)
-    selected_tokens = selected_tokens[sort_order]
-    selected_local_experts = selected_local_experts[sort_order]
-    selected_weights = selected_weights[sort_order]
-
-    counts = torch.bincount(selected_local_experts, minlength=NUM_LOCAL_EXPERTS)
-
+    token_sorted, w_sorted, active_local_ids, offs = plan
     a = _dequant_hidden_states(hidden_states, hidden_states_scale)
+    a_cat = a.index_select(0, token_sorted).contiguous()
 
-    offset = 0
-    for local_expert_id in range(NUM_LOCAL_EXPERTS):
-        num_tok = int(counts[local_expert_id].item())
-        if num_tok == 0:
-            continue
+    w13_t_all, w2_t_all = _get_dequantized_weight_pack(
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+    )
+    w13_t = w13_t_all.index_select(0, active_local_ids).contiguous()
+    w2_t = w2_t_all.index_select(0, active_local_ids).contiguous()
 
-        next_offset = offset + num_tok
-        token_idx = selected_tokens[offset:next_offset]
-        w_tok = selected_weights[offset:next_offset]
-        offset = next_offset
+    g1 = torch.ops.aten._grouped_mm(a_cat, w13_t, offs)
+    c = _swiglu_triton(g1)
+    o = torch.ops.aten._grouped_mm(c, w2_t, offs)
 
-        a_e = a.index_select(0, token_idx)
-
-        w13_e = _dequant_w13(
-            gemm1_weights[local_expert_id],
-            gemm1_weights_scale[local_expert_id],
-        )
-        g1 = torch.matmul(a_e, w13_e.transpose(0, 1).contiguous())
-        c = _swiglu_triton(g1)
-
-        w2_e = _dequant_w2(
-            gemm2_weights[local_expert_id],
-            gemm2_weights_scale[local_expert_id],
-        )
-        o = torch.matmul(c, w2_e.transpose(0, 1).contiguous())
-
-        output.index_add_(0, token_idx, o.to(torch.float32) * w_tok.unsqueeze(1))
-
+    output.index_add_(0, token_sorted, o.to(torch.float32) * w_sorted.unsqueeze(1))
     return output.to(torch.bfloat16).to(output_device)

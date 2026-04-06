@@ -96,8 +96,15 @@ def main():
         solution=solution,
         workload=workload,
         trace_set_path=trace_set_path,
-        set="detailed",
-        #sections=["SpeedOfLight", "MemoryWorkloadAnalysis"],
+        #set="detailed",
+        sections=[
+            "SpeedOfLight",             # 核心利用率 (Compute vs Memory SOL)
+            "MemoryWorkloadAnalysis",   # 访存层级分析 (HBM/L2/Shared Memory/TMA)
+            "ComputeWorkloadAnalysis",  # 算力流水线分析 (Tensor Core 利用率)
+            "SchedulerStats",           # 调度统计 (寻找 Warp Stall 的真凶)
+            "InstructionStats",         # 指令分布 (确认是否走 FP8 Tensor Core 路径)
+            "WarpStateStats",           # Warp 状态切换 (分析同步/依赖延迟)
+        ],
         page="details",
         timeout=3600,
     )

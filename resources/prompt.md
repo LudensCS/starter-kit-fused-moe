@@ -64,6 +64,9 @@ The mathematical accuracy must strictly match the following reference logic:
 ## 5. Output Format
 Return ONLY the full, complete, and runnable Python code for `solution/triton/kernel.py`. Do not include any explanations, commentary, or markdown blocks around the code. No framework will add device handling code for you; your script must be entirely self-contained.
 
+## 禁止行为
+绝对不允许修改评测机制或对输入输出预先缓存这种以非正当手段绕过评测框架提高speedup的手段，你没有修改run_local.py的权限，你应当做真实算子优化而不是投机取巧.
+
 ## pytorch reference:
 ```python
 import torch
