@@ -51,7 +51,9 @@ def _dequant_hidden_selected_kernel(
         mask=mask_h,
         other=0.0,
     ).to(tl.float32)
-    s = tl.load(scale_ptr + pid_blk * stride_s_b + src_row * stride_s_t).to(tl.float32)
+    s = tl.load(
+        scale_ptr + pid_blk * stride_s_b + src_row * stride_s_t
+    ).to(tl.float32)
     y = x * s
     tl.store(
         out_ptr + pid_row * stride_o_t + offs_h * stride_o_h,
@@ -87,10 +89,7 @@ def _dequant_single_expert_weight_kernel(
     mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
 
     w = tl.load(
-        w_ptr
-        + expert_idx * stride_w_e
-        + offs_m[:, None] * stride_w_m
-        + offs_k[None, :] * stride_w_k,
+        w_ptr + expert_idx * stride_w_e + offs_m[:, None] * stride_w_m + offs_k[None, :] * stride_w_k,
         mask=mask,
         other=0.0,
     ).to(tl.float32)
@@ -107,9 +106,7 @@ def _dequant_single_expert_weight_kernel(
 
 def _ensure_cuda_available():
     if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA is required for this Triton implementation, but CUDA is not available."
-        )
+        raise RuntimeError("CUDA is required for this Triton implementation, but CUDA is not available.")
 
 
 def _infer_primary_device(*args, **kwargs):
@@ -147,17 +144,11 @@ def _validate_shapes(
     T = routing_logits.shape[0]
 
     if tuple(routing_logits.shape) != (T, E_GLOBAL_CONST):
-        raise ValueError(
-            f"routing_logits must have shape ({T}, {E_GLOBAL_CONST}), got {tuple(routing_logits.shape)}"
-        )
+        raise ValueError(f"routing_logits must have shape ({T}, {E_GLOBAL_CONST}), got {tuple(routing_logits.shape)}")
     if routing_bias.shape[-1] != E_GLOBAL_CONST:
-        raise ValueError(
-            f"routing_bias last dim must be {E_GLOBAL_CONST}, got {routing_bias.shape[-1]}"
-        )
+        raise ValueError(f"routing_bias last dim must be {E_GLOBAL_CONST}, got {routing_bias.shape[-1]}")
     if tuple(hidden_states.shape) != (T, H_CONST):
-        raise ValueError(
-            f"hidden_states must have shape ({T}, {H_CONST}), got {tuple(hidden_states.shape)}"
-        )
+        raise ValueError(f"hidden_states must have shape ({T}, {H_CONST}), got {tuple(hidden_states.shape)}")
     if tuple(hidden_states_scale.shape) != (NUM_HIDDEN_BLOCKS, T):
         raise ValueError(
             f"hidden_states_scale must have shape ({NUM_HIDDEN_BLOCKS}, {T}), got {tuple(hidden_states_scale.shape)}"
@@ -166,11 +157,7 @@ def _validate_shapes(
         raise ValueError(
             f"gemm1_weights must have shape ({E_LOCAL_CONST}, {GEMM1_OUT_CONST}, {H_CONST}), got {tuple(gemm1_weights.shape)}"
         )
-    if tuple(gemm1_weights_scale.shape) != (
-        E_LOCAL_CONST,
-        NUM_GEMM1_OUT_BLOCKS,
-        NUM_HIDDEN_BLOCKS,
-    ):
+    if tuple(gemm1_weights_scale.shape) != (E_LOCAL_CONST, NUM_GEMM1_OUT_BLOCKS, NUM_HIDDEN_BLOCKS):
         raise ValueError(
             f"gemm1_weights_scale must have shape ({E_LOCAL_CONST}, {NUM_GEMM1_OUT_BLOCKS}, {NUM_HIDDEN_BLOCKS}), got {tuple(gemm1_weights_scale.shape)}"
         )
@@ -178,11 +165,7 @@ def _validate_shapes(
         raise ValueError(
             f"gemm2_weights must have shape ({E_LOCAL_CONST}, {H_CONST}, {I_CONST}), got {tuple(gemm2_weights.shape)}"
         )
-    if tuple(gemm2_weights_scale.shape) != (
-        E_LOCAL_CONST,
-        NUM_HIDDEN_BLOCKS,
-        NUM_INTERMEDIATE_BLOCKS,
-    ):
+    if tuple(gemm2_weights_scale.shape) != (E_LOCAL_CONST, NUM_HIDDEN_BLOCKS, NUM_INTERMEDIATE_BLOCKS):
         raise ValueError(
             f"gemm2_weights_scale must have shape ({E_LOCAL_CONST}, {NUM_HIDDEN_BLOCKS}, {NUM_INTERMEDIATE_BLOCKS}), got {tuple(gemm2_weights_scale.shape)}"
         )
@@ -190,9 +173,7 @@ def _validate_shapes(
 
 def _dequant_hidden_selected_triton(hidden_states, hidden_states_scale, row_idx):
     n_rows = int(row_idx.numel())
-    out = torch.empty(
-        (n_rows, H_CONST), device=hidden_states.device, dtype=torch.float32
-    )
+    out = torch.empty((n_rows, H_CONST), device=hidden_states.device, dtype=torch.float32)
     if n_rows == 0:
         return out
 
@@ -216,16 +197,14 @@ def _dequant_hidden_selected_triton(hidden_states, hidden_states_scale, row_idx)
         n_rows,
         H_CONST,
         BLOCK_H=BLOCK_Q,
-        num_warps=8,
-        num_stages=4,
+        num_warps=4,
+        num_stages=2,
     )
     return out
 
 
 def _dequant_single_w13_triton(gemm1_weights, gemm1_weights_scale, local_expert_idx):
-    out = torch.empty(
-        (GEMM1_OUT_CONST, H_CONST), device=gemm1_weights.device, dtype=torch.float32
-    )
+    out = torch.empty((GEMM1_OUT_CONST, H_CONST), device=gemm1_weights.device, dtype=torch.float32)
     w = gemm1_weights.contiguous()
     s = gemm1_weights_scale.contiguous()
 
@@ -247,16 +226,14 @@ def _dequant_single_w13_triton(gemm1_weights, gemm1_weights_scale, local_expert_
         H_CONST,
         BLOCK_M=BLOCK_Q,
         BLOCK_K=BLOCK_Q,
-        num_warps=8,
-        num_stages=4,
+        num_warps=4,
+        num_stages=2,
     )
     return out
 
 
 def _dequant_single_w2_triton(gemm2_weights, gemm2_weights_scale, local_expert_idx):
-    out = torch.empty(
-        (H_CONST, I_CONST), device=gemm2_weights.device, dtype=torch.float32
-    )
+    out = torch.empty((H_CONST, I_CONST), device=gemm2_weights.device, dtype=torch.float32)
     w = gemm2_weights.contiguous()
     s = gemm2_weights_scale.contiguous()
 
@@ -278,8 +255,8 @@ def _dequant_single_w2_triton(gemm2_weights, gemm2_weights_scale, local_expert_i
         I_CONST,
         BLOCK_M=BLOCK_Q,
         BLOCK_K=BLOCK_Q,
-        num_warps=8,
-        num_stages=4,
+        num_warps=4,
+        num_stages=2,
     )
     return out
 
@@ -302,23 +279,15 @@ def _route_local_compact(
     top2_vals, _ = torch.topk(grouped, k=2, dim=2, largest=True, sorted=False)
     group_scores = top2_vals.sum(dim=2)
 
-    _, group_idx = torch.topk(
-        group_scores, k=TOPK_GROUP_CONST, dim=1, largest=True, sorted=False
-    )
+    _, group_idx = torch.topk(group_scores, k=TOPK_GROUP_CONST, dim=1, largest=True, sorted=False)
     group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1.0)
 
-    score_mask = (
-        group_mask.unsqueeze(2)
-        .expand(-1, N_GROUP_CONST, group_size)
-        .reshape(-1, E_GLOBAL_CONST)
-    )
+    score_mask = group_mask.unsqueeze(2).expand(-1, N_GROUP_CONST, group_size).reshape(-1, E_GLOBAL_CONST)
     neg_inf = torch.finfo(torch.float32).min
     scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
 
-    _, topk_idx = torch.topk(
-        scores_pruned, k=TOP_K_CONST, dim=1, largest=True, sorted=False
-    )
+    _, topk_idx = torch.topk(scores_pruned, k=TOP_K_CONST, dim=1, largest=True, sorted=False)
 
     topk_s = s.gather(1, topk_idx)
     topk_s_sum = topk_s.sum(dim=1, keepdim=True) + 1.0e-20
@@ -332,11 +301,7 @@ def _route_local_compact(
         empty = torch.empty((0,), device=device, dtype=torch.int64)
         return empty, {}, []
 
-    token_grid = (
-        torch.arange(topk_idx.shape[0], device=device, dtype=torch.int64)
-        .unsqueeze(1)
-        .expand(-1, TOP_K_CONST)
-    )
+    token_grid = torch.arange(topk_idx.shape[0], device=device, dtype=torch.int64).unsqueeze(1).expand(-1, TOP_K_CONST)
     pair_token_idx = token_grid[valid_slot]
     pair_local_idx = topk_local[valid_slot].to(torch.int64)
     pair_weight = topk_weights[valid_slot]
@@ -359,70 +324,6 @@ def _route_local_compact(
         start = end
 
     return selected_rows, expert_data, active_local.tolist()
-
-
-def _accumulate_expert_outputs_batched(
-    output,
-    A_sel,
-    selected_rows,
-    pos_map,
-    expert_data,
-    active_local,
-    gemm1_weights,
-    gemm1_weights_scale,
-    gemm2_weights,
-    gemm2_weights_scale,
-):
-    if len(active_local) == 0:
-        return
-
-    n_active = len(active_local)
-    max_tokens = max((expert_data[le][0].numel() for le in active_local), default=0)
-    if max_tokens == 0:
-        return
-
-    # pad to uniform shape for batch GEMM
-    tokens_padded = torch.full(
-        (n_active, max_tokens), selected_rows[0], device=A_sel.device, dtype=torch.int64
-    )
-    weights_padded = torch.zeros(
-        (n_active, max_tokens), device=A_sel.device, dtype=torch.float32
-    )
-    for i, le in enumerate(active_local):
-        tok_idx, w_tok = expert_data[le]
-        if tok_idx.numel() == 0:
-            continue
-        tokens_padded[i, : tok_idx.numel()] = tok_idx
-        weights_padded[i, : tok_idx.numel()] = w_tok
-
-    # Map to selected row indices and gather A
-    flat_tokens = tokens_padded.view(-1)
-    selected_pos = pos_map[flat_tokens]
-    A_block = A_sel.index_select(0, selected_pos)
-    A_block = A_block.view(n_active, max_tokens, H_CONST)
-
-    # Dequantize expert weights and stack
-    W13_list = []
-    W2_list = []
-    for le in active_local:
-        W13_e = _dequant_single_w13_triton(gemm1_weights, gemm1_weights_scale, le)
-        W2_e = _dequant_single_w2_triton(gemm2_weights, gemm2_weights_scale, le)
-        W13_list.append(W13_e)
-        W2_list.append(W2_e)
-
-    W13_all = torch.stack(W13_list, dim=0)
-    W2_all = torch.stack(W2_list, dim=0)
-
-    # Batched GEMM1 -> SwiGLU -> GEMM2
-    G1 = torch.bmm(A_block, W13_all.transpose(1, 2))
-    X1 = G1[:, :, :I_CONST]
-    X2 = G1[:, :, I_CONST:]
-    C = X1 * F.silu(X2)
-    O = torch.bmm(C, W2_all.transpose(1, 2))
-
-    # Accumulate
-    scaled_O = O * weights_padded.unsqueeze(-1)
-    output.index_add_(0, flat_tokens, scaled_O.view(-1, H_CONST))
 
 
 @torch.no_grad()
@@ -504,27 +405,39 @@ def run(*args, **kwargs):
             result = result.to(original_device)
         return result
 
-    A_sel = _dequant_hidden_selected_triton(
-        hidden_states, hidden_states_scale, selected_rows
-    )
+    A_sel = _dequant_hidden_selected_triton(hidden_states, hidden_states_scale, selected_rows)
 
     pos_map = torch.full((T,), -1, device=device, dtype=torch.int64)
-    pos_map[selected_rows] = torch.arange(
-        selected_rows.numel(), device=device, dtype=torch.int64
-    )
+    pos_map[selected_rows] = torch.arange(selected_rows.numel(), device=device, dtype=torch.int64)
 
-    _accumulate_expert_outputs_batched(
-        output,
-        A_sel,
-        selected_rows,
-        pos_map,
-        expert_data,
-        active_local,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm2_weights,
-        gemm2_weights_scale,
-    )
+    w13_cache = {}
+    w2_cache = {}
+
+    for le in active_local:
+        token_idx, w_tok = expert_data[le]
+        if token_idx.numel() == 0:
+            continue
+
+        gathered_pos = pos_map[token_idx]
+        A_e = A_sel.index_select(0, gathered_pos)
+
+        W13_e = w13_cache.get(le)
+        if W13_e is None:
+            W13_e = _dequant_single_w13_triton(gemm1_weights, gemm1_weights_scale, le)
+            w13_cache[le] = W13_e
+
+        W2_e = w2_cache.get(le)
+        if W2_e is None:
+            W2_e = _dequant_single_w2_triton(gemm2_weights, gemm2_weights_scale, le)
+            w2_cache[le] = W2_e
+
+        G1 = torch.matmul(A_e, W13_e.transpose(0, 1))
+        X1 = G1[:, :I_CONST]
+        X2 = G1[:, I_CONST:]
+        C = X1 * F.silu(X2)
+        O = torch.matmul(C, W2_e.transpose(0, 1))
+
+        output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
 
     result = output.to(torch.bfloat16)
     if original_device.type != "cuda":
