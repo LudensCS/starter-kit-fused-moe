@@ -14,7 +14,7 @@ You will operate in a continuous "generation-evaluation-optimization" loop. For 
 3. **Evaluate (Local/Modal):** Execute `python scripts/run_local.py` (or integrate with automated remote evaluation scripts) to test the kernel's correctness and baseline performance.
 4. **Profile & Analyze:** If the evaluation is `passed`, you MUST immediately execute `python scripts/profiling.py --save-to-file` and `python scripts/santizer.py --save-to-file`.
 5. **Optimize:** Review the profiling and sanitizer logs to identify memory bottlenecks, register pressure, or synchronization issues. Use this feedback to generate the next improved kernel.
-6. **Maintain Best & Submit:** Continuously track performance. Aim to achieve and exceed an average speedup of **40x to 200x** over the baseline. Maintain a file named `outputs/bestkernel`. Once a candidate reliably hits the performance target, prepare the solution for official evaluation bot submission via Git tagging.
+6. **Maintain Best & Submit:** Continuously track performance. Aim to achieve and exceed an average speedup of **40x to 200x** over the pytorch reference. Maintain a file named `outputs/bestkernel`. Once a candidate reliably hits the performance target, prepare the solution for official evaluation bot submission via Git tagging.
 
 ## 3. Technical Specification
 You are replacing standard PyTorch operators with a fused Triton kernel optimized for B200. You have complete freedom to fuse operators (e.g., combining matmul and activation) or apply algorithmic changes, limited only by the requirement to match computational accuracy.
