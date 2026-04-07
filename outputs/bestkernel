@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
 
 NUM_EXPERTS_GLOBAL = 256
 NUM_LOCAL_EXPERTS = 32
@@ -16,6 +17,8 @@ NUM_GEMM1_OUT_BLOCKS = (2 * INTERMEDIATE_SIZE) // BLOCK_SIZE
 EXPERTS_PER_GROUP = NUM_EXPERTS_GLOBAL // N_GROUP
 EPS = 1e-20
 _GROUP_OFFSETS = None
+HYBRID_FLASHINFER_MAX_SEQ = 4096
+HYBRID_FLASHINFER_MIN_SEQ = 10000
 
 _ACTIVE_WEIGHT_CACHE_KEY = None
 _ACTIVE_WEIGHT_CACHE_VALUE = None
@@ -118,17 +121,17 @@ def _dequant_selected_hidden_states(
     token_idx: torch.Tensor,
 ) -> torch.Tensor:
     m = token_idx.numel()
-    a = hidden_states.index_select(0, token_idx).to(torch.bfloat16).view(
+    a = hidden_states.index_select(0, token_idx).to(torch.float32).view(
         m, NUM_HIDDEN_BLOCKS, BLOCK_SIZE
     )
     s = (
-        hidden_states_scale.to(torch.bfloat16)
+        hidden_states_scale.to(torch.float32)
         .transpose(0, 1)
         .contiguous()
         .index_select(0, token_idx)
         .unsqueeze(-1)
     )
-    return (a * s).view(m, HIDDEN_SIZE)
+    return (a * s).view(m, HIDDEN_SIZE).to(torch.bfloat16)
 
 
 def _dequant_selected_w13_t(
@@ -137,20 +140,20 @@ def _dequant_selected_w13_t(
     active_local_ids: torch.Tensor,
 ) -> torch.Tensor:
     n = active_local_ids.numel()
-    w = gemm1_weights.index_select(0, active_local_ids).to(torch.bfloat16).view(
+    w = gemm1_weights.index_select(0, active_local_ids).to(torch.float32).view(
         n,
         NUM_GEMM1_OUT_BLOCKS,
         BLOCK_SIZE,
         NUM_HIDDEN_BLOCKS,
         BLOCK_SIZE,
     )
-    s = gemm1_weights_scale.index_select(0, active_local_ids).to(torch.bfloat16).view(
+    s = gemm1_weights_scale.index_select(0, active_local_ids).to(torch.float32).view(
         n,
         NUM_GEMM1_OUT_BLOCKS,
         NUM_HIDDEN_BLOCKS,
     )
     deq = (w * s[:, :, None, :, None]).view(n, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE)
-    return deq.transpose(1, 2).contiguous()
+    return deq.transpose(1, 2).contiguous().to(torch.bfloat16)
 
 
 def _dequant_selected_w2_t(
@@ -159,20 +162,20 @@ def _dequant_selected_w2_t(
     active_local_ids: torch.Tensor,
 ) -> torch.Tensor:
     n = active_local_ids.numel()
-    w = gemm2_weights.index_select(0, active_local_ids).to(torch.bfloat16).view(
+    w = gemm2_weights.index_select(0, active_local_ids).to(torch.float32).view(
         n,
         NUM_HIDDEN_BLOCKS,
         BLOCK_SIZE,
         NUM_INTERMEDIATE_BLOCKS,
         BLOCK_SIZE,
     )
-    s = gemm2_weights_scale.index_select(0, active_local_ids).to(torch.bfloat16).view(
+    s = gemm2_weights_scale.index_select(0, active_local_ids).to(torch.float32).view(
         n,
         NUM_HIDDEN_BLOCKS,
         NUM_INTERMEDIATE_BLOCKS,
     )
     deq = (w * s[:, :, None, :, None]).view(n, HIDDEN_SIZE, INTERMEDIATE_SIZE)
-    return deq.transpose(1, 2).contiguous()
+    return deq.transpose(1, 2).contiguous().to(torch.bfloat16)
 
 
 def _base_weight_cache_key(
@@ -256,12 +259,12 @@ def _build_local_plan(
     local_mask = (local_idx >= 0) & (local_idx < NUM_LOCAL_EXPERTS)
 
     nz = torch.nonzero(local_mask, as_tuple=False)
-    token_flat = nz[:, 0]
-    k_slot = nz[:, 1]
-    expert_flat = local_idx[token_flat, k_slot]
-    w_flat = topk_weights[token_flat, k_slot]
+    token_flat = nz[:, 0].to(torch.int64)
+    k_slot = nz[:, 1].to(torch.int64)
+    expert_flat = local_idx[token_flat, k_slot].to(torch.int64)
+    w_flat = topk_weights[token_flat, k_slot].to(torch.float32)
 
-    order = torch.argsort(expert_flat)
+    order = torch.argsort(expert_flat, stable=True)
     token_sorted = token_flat[order]
     expert_sorted = expert_flat[order]
     w_sorted = w_flat[order]
@@ -270,6 +273,63 @@ def _build_local_plan(
         token_sorted.contiguous(),
         w_sorted.contiguous(),
         expert_sorted.contiguous(),
+    )
+
+
+def _run_flashinfer_path(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    local_expert_offset: int,
+    routed_scaling_factor: float,
+):
+    seq_len = routing_logits.shape[0]
+    tune_max_num_tokens = 16384 if seq_len >= 8192 else 8192
+
+    routing_logits_f32 = (
+        routing_logits if routing_logits.dtype == torch.float32 else routing_logits.float()
+    )
+    hidden_states_scale_f32 = (
+        hidden_states_scale
+        if hidden_states_scale.dtype == torch.float32
+        else hidden_states_scale.float()
+    )
+    gemm1_weights_scale_f32 = (
+        gemm1_weights_scale
+        if gemm1_weights_scale.dtype == torch.float32
+        else gemm1_weights_scale.float()
+    )
+    gemm2_weights_scale_f32 = (
+        gemm2_weights_scale
+        if gemm2_weights_scale.dtype == torch.float32
+        else gemm2_weights_scale.float()
+    )
+    return trtllm_fp8_block_scale_moe(
+        routing_logits_f32,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale_f32,
+        gemm1_weights,
+        gemm1_weights_scale_f32,
+        gemm2_weights,
+        gemm2_weights_scale_f32,
+        NUM_EXPERTS_GLOBAL,
+        TOP_K,
+        N_GROUP,
+        TOPK_GROUP,
+        INTERMEDIATE_SIZE,
+        local_expert_offset,
+        NUM_LOCAL_EXPERTS,
+        routed_scaling_factor,
+        routing_method_type=2,
+        use_shuffled_weight=False,
+        enable_pdl=True,
+        tune_max_num_tokens=tune_max_num_tokens,
     )
 
 
@@ -339,8 +399,23 @@ def run(
 
     seq_len = routing_logits.shape[0]
 
+    if seq_len <= HYBRID_FLASHINFER_MAX_SEQ or seq_len >= HYBRID_FLASHINFER_MIN_SEQ:
+        out = _run_flashinfer_path(
+            routing_logits,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights,
+            gemm2_weights_scale,
+            local_expert_offset,
+            routed_scaling_factor,
+        )
+        return out if not return_to_origin else out.to(output_device)
+
     output = torch.zeros(
-        (seq_len, HIDDEN_SIZE), dtype=torch.bfloat16, device=routing_logits.device
+        (seq_len, HIDDEN_SIZE), dtype=torch.float32, device=routing_logits.device
     )
 
     plan = _build_local_plan(
@@ -351,7 +426,7 @@ def run(
     )
     token_sorted, w_sorted, expert_sorted = plan
     if token_sorted.numel() == 0:
-        return output.to(output_device)
+        return output.to(torch.bfloat16).to(output_device)
     a_cat = _dequant_selected_hidden_states(hidden_states, hidden_states_scale, token_sorted)
 
     base_weight_key = _base_weight_cache_key(
@@ -379,7 +454,7 @@ def run(
     g1 = torch.ops.aten._grouped_mm(a_cat, w13_t, offs)
     c = _swiglu_triton(g1)
     o = torch.ops.aten._grouped_mm(c, w2_t, offs)
-    output.index_add_(
-        0, token_sorted, o * w_sorted.unsqueeze(1).to(dtype=torch.bfloat16)
-    )
-    return output if not return_to_origin else output.to(output_device)
+    output.index_add_(0, token_sorted, o.to(torch.float32) * w_sorted.unsqueeze(1))
+
+    out = output.to(torch.bfloat16)
+    return out if not return_to_origin else out.to(output_device)
