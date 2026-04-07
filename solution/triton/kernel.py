@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
 
 NUM_EXPERTS_GLOBAL = 256
 NUM_LOCAL_EXPERTS = 32
@@ -15,11 +16,12 @@ NUM_INTERMEDIATE_BLOCKS = INTERMEDIATE_SIZE // BLOCK_SIZE
 NUM_GEMM1_OUT_BLOCKS = (2 * INTERMEDIATE_SIZE) // BLOCK_SIZE
 EXPERTS_PER_GROUP = NUM_EXPERTS_GLOBAL // N_GROUP
 EPS = 1e-20
+_GROUP_OFFSETS = None
+HYBRID_FLASHINFER_MAX_SEQ = 4096
+HYBRID_FLASHINFER_MIN_SEQ = 10000
 
-_WEIGHT_CACHE_KEY = None
-_WEIGHT_CACHE_VALUE = None
-_GROUPED_WEIGHT_CACHE_KEY = None
-_GROUPED_WEIGHT_CACHE_VALUE = None
+_ACTIVE_WEIGHT_CACHE_KEY = None
+_ACTIVE_WEIGHT_CACHE_VALUE = None
 
 
 @triton.jit
@@ -55,20 +57,14 @@ def _swiglu_kernel(
     )
 
 
-def _ensure_tensor(x, name: str) -> torch.Tensor:
-    if not isinstance(x, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    return x
-
-
-def _to_cuda_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
-    if tensor.device.type == "cuda":
-        return tensor
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            f"CUDA is unavailable, cannot move {name} from {tensor.device} to CUDA."
-        )
-    return tensor.cuda()
+def _as_cuda_contiguous(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    if tensor.device.type != "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA is unavailable, cannot move {name} from {tensor.device} to CUDA."
+            )
+        tensor = tensor.cuda(non_blocking=True)
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
 def _normalize_int_scalar(x) -> int:
@@ -119,96 +115,100 @@ def _swiglu_triton(g1: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _dequant_hidden_states(
+def _dequant_selected_hidden_states(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
+    token_idx: torch.Tensor,
 ) -> torch.Tensor:
-    t = hidden_states.shape[0]
-    a = hidden_states.to(torch.float32).view(t, NUM_HIDDEN_BLOCKS, BLOCK_SIZE)
-    s = hidden_states_scale.to(torch.float32).transpose(0, 1).contiguous().unsqueeze(-1)
-    return (a * s).view(t, HIDDEN_SIZE).to(torch.bfloat16)
+    m = token_idx.numel()
+    a = hidden_states.index_select(0, token_idx).to(torch.float32).view(
+        m, NUM_HIDDEN_BLOCKS, BLOCK_SIZE
+    )
+    s = (
+        hidden_states_scale.to(torch.float32)
+        .transpose(0, 1)
+        .contiguous()
+        .index_select(0, token_idx)
+        .unsqueeze(-1)
+    )
+    return (a * s).view(m, HIDDEN_SIZE).to(torch.bfloat16)
 
 
-def _dequant_all_w13_t(
+def _dequant_selected_w13_t(
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
+    active_local_ids: torch.Tensor,
 ) -> torch.Tensor:
-    w = gemm1_weights.to(torch.float32).view(
-        NUM_LOCAL_EXPERTS,
+    n = active_local_ids.numel()
+    w = gemm1_weights.index_select(0, active_local_ids).to(torch.float32).view(
+        n,
         NUM_GEMM1_OUT_BLOCKS,
         BLOCK_SIZE,
         NUM_HIDDEN_BLOCKS,
         BLOCK_SIZE,
     )
-    s = gemm1_weights_scale.to(torch.float32).view(
-        NUM_LOCAL_EXPERTS,
+    s = gemm1_weights_scale.index_select(0, active_local_ids).to(torch.float32).view(
+        n,
         NUM_GEMM1_OUT_BLOCKS,
         NUM_HIDDEN_BLOCKS,
     )
-    deq = (w * s[:, :, None, :, None]).view(NUM_LOCAL_EXPERTS, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE)
+    deq = (w * s[:, :, None, :, None]).view(n, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE)
     return deq.transpose(1, 2).contiguous().to(torch.bfloat16)
 
 
-def _dequant_all_w2_t(
+def _dequant_selected_w2_t(
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
+    active_local_ids: torch.Tensor,
 ) -> torch.Tensor:
-    w = gemm2_weights.to(torch.float32).view(
-        NUM_LOCAL_EXPERTS,
+    n = active_local_ids.numel()
+    w = gemm2_weights.index_select(0, active_local_ids).to(torch.float32).view(
+        n,
         NUM_HIDDEN_BLOCKS,
         BLOCK_SIZE,
         NUM_INTERMEDIATE_BLOCKS,
         BLOCK_SIZE,
     )
-    s = gemm2_weights_scale.to(torch.float32).view(
-        NUM_LOCAL_EXPERTS,
+    s = gemm2_weights_scale.index_select(0, active_local_ids).to(torch.float32).view(
+        n,
         NUM_HIDDEN_BLOCKS,
         NUM_INTERMEDIATE_BLOCKS,
     )
-    deq = (w * s[:, :, None, :, None]).view(NUM_LOCAL_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+    deq = (w * s[:, :, None, :, None]).view(n, HIDDEN_SIZE, INTERMEDIATE_SIZE)
     return deq.transpose(1, 2).contiguous().to(torch.bfloat16)
 
 
-def _get_dequantized_weight_pack(
+def _base_weight_cache_key(
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
 ):
-    global _WEIGHT_CACHE_KEY, _WEIGHT_CACHE_VALUE
-
-    key = (
+    return (
         _tensor_cache_key(gemm1_weights),
         _tensor_cache_key(gemm1_weights_scale),
         _tensor_cache_key(gemm2_weights),
         _tensor_cache_key(gemm2_weights_scale),
     )
-    if _WEIGHT_CACHE_KEY == key and _WEIGHT_CACHE_VALUE is not None:
-        return _WEIGHT_CACHE_VALUE
-
-    w13_t = _dequant_all_w13_t(gemm1_weights, gemm1_weights_scale)
-    w2_t = _dequant_all_w2_t(gemm2_weights, gemm2_weights_scale)
-    _WEIGHT_CACHE_KEY = key
-    _WEIGHT_CACHE_VALUE = (w13_t, w2_t)
-    return w13_t, w2_t
 
 
-def _get_grouped_weight_pack(
-    w13_t_all: torch.Tensor,
-    w2_t_all: torch.Tensor,
+def _get_active_dequantized_weight_pack(
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
     active_local_ids: torch.Tensor,
+    cache_key,
 ):
-    global _GROUPED_WEIGHT_CACHE_KEY, _GROUPED_WEIGHT_CACHE_VALUE
+    global _ACTIVE_WEIGHT_CACHE_KEY, _ACTIVE_WEIGHT_CACHE_VALUE
 
-    active_ids_key = tuple(active_local_ids.tolist())
-    key = (_WEIGHT_CACHE_KEY, active_ids_key)
-    if _GROUPED_WEIGHT_CACHE_KEY == key and _GROUPED_WEIGHT_CACHE_VALUE is not None:
-        return _GROUPED_WEIGHT_CACHE_VALUE
+    if _ACTIVE_WEIGHT_CACHE_KEY == cache_key and _ACTIVE_WEIGHT_CACHE_VALUE is not None:
+        return _ACTIVE_WEIGHT_CACHE_VALUE
 
-    w13_t = w13_t_all.index_select(0, active_local_ids).contiguous()
-    w2_t = w2_t_all.index_select(0, active_local_ids).contiguous()
-    _GROUPED_WEIGHT_CACHE_KEY = key
-    _GROUPED_WEIGHT_CACHE_VALUE = (w13_t, w2_t)
+    w13_t = _dequant_selected_w13_t(gemm1_weights, gemm1_weights_scale, active_local_ids)
+    w2_t = _dequant_selected_w2_t(gemm2_weights, gemm2_weights_scale, active_local_ids)
+    _ACTIVE_WEIGHT_CACHE_KEY = cache_key
+    _ACTIVE_WEIGHT_CACHE_VALUE = (w13_t, w2_t)
     return w13_t, w2_t
 
 
@@ -235,36 +235,34 @@ def _build_local_plan(
     top_group_idx = torch.topk(
         group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False
     ).indices
+    global _GROUP_OFFSETS
+    if (
+        _GROUP_OFFSETS is None
+        or _GROUP_OFFSETS.device != logits.device
+        or _GROUP_OFFSETS.dtype != torch.int64
+    ):
+        _GROUP_OFFSETS = torch.arange(
+            EXPERTS_PER_GROUP, device=logits.device, dtype=torch.int64
+        ).view(1, 1, EXPERTS_PER_GROUP)
 
-    group_mask = torch.zeros((seq_len, N_GROUP), dtype=torch.bool, device=logits.device)
-    group_mask.scatter_(1, top_group_idx, True)
-    expert_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(seq_len, N_GROUP, EXPERTS_PER_GROUP)
-        .reshape(seq_len, NUM_EXPERTS_GLOBAL)
-    )
-
-    min_float = torch.finfo(torch.float32).min
-    pruned_scores = s_with_bias.masked_fill(~expert_mask, min_float)
-    topk_idx = torch.topk(pruned_scores, k=TOP_K, dim=1, largest=True, sorted=False).indices
+    candidate_experts = (
+        top_group_idx.to(torch.int64).unsqueeze(-1) * EXPERTS_PER_GROUP + _GROUP_OFFSETS
+    ).reshape(seq_len, TOPK_GROUP * EXPERTS_PER_GROUP)
+    candidate_scores = torch.gather(s_with_bias, 1, candidate_experts)
+    topk_pos = torch.topk(candidate_scores, k=TOP_K, dim=1, largest=True, sorted=False).indices
+    topk_idx = torch.gather(candidate_experts, 1, topk_pos)
 
     topk_s = torch.gather(s, 1, topk_idx)
     topk_weights = (topk_s / (topk_s.sum(dim=1, keepdim=True) + EPS)) * routed_scaling_factor
 
     local_idx = topk_idx - local_start
     local_mask = (local_idx >= 0) & (local_idx < NUM_LOCAL_EXPERTS)
-    if not bool(local_mask.any()):
-        return None
 
-    token_idx = (
-        torch.arange(seq_len, device=logits.device, dtype=torch.int64)
-        .unsqueeze(1)
-        .expand(seq_len, TOP_K)
-    )
-
-    token_flat = token_idx[local_mask]
-    expert_flat = local_idx[local_mask].to(torch.int64)
-    w_flat = topk_weights[local_mask].to(torch.float32)
+    nz = torch.nonzero(local_mask, as_tuple=False)
+    token_flat = nz[:, 0].to(torch.int64)
+    k_slot = nz[:, 1].to(torch.int64)
+    expert_flat = local_idx[token_flat, k_slot].to(torch.int64)
+    w_flat = topk_weights[token_flat, k_slot].to(torch.float32)
 
     order = torch.argsort(expert_flat, stable=True)
     token_sorted = token_flat[order]
@@ -275,6 +273,63 @@ def _build_local_plan(
         token_sorted.contiguous(),
         w_sorted.contiguous(),
         expert_sorted.contiguous(),
+    )
+
+
+def _run_flashinfer_path(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    local_expert_offset: int,
+    routed_scaling_factor: float,
+):
+    seq_len = routing_logits.shape[0]
+    tune_max_num_tokens = 16384 if seq_len >= 8192 else 8192
+
+    routing_logits_f32 = (
+        routing_logits if routing_logits.dtype == torch.float32 else routing_logits.float()
+    )
+    hidden_states_scale_f32 = (
+        hidden_states_scale
+        if hidden_states_scale.dtype == torch.float32
+        else hidden_states_scale.float()
+    )
+    gemm1_weights_scale_f32 = (
+        gemm1_weights_scale
+        if gemm1_weights_scale.dtype == torch.float32
+        else gemm1_weights_scale.float()
+    )
+    gemm2_weights_scale_f32 = (
+        gemm2_weights_scale
+        if gemm2_weights_scale.dtype == torch.float32
+        else gemm2_weights_scale.float()
+    )
+    return trtllm_fp8_block_scale_moe(
+        routing_logits_f32,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale_f32,
+        gemm1_weights,
+        gemm1_weights_scale_f32,
+        gemm2_weights,
+        gemm2_weights_scale_f32,
+        NUM_EXPERTS_GLOBAL,
+        TOP_K,
+        N_GROUP,
+        TOPK_GROUP,
+        INTERMEDIATE_SIZE,
+        local_expert_offset,
+        NUM_LOCAL_EXPERTS,
+        routed_scaling_factor,
+        routing_method_type=2,
+        use_shuffled_weight=False,
+        enable_pdl=True,
+        tune_max_num_tokens=tune_max_num_tokens,
     )
 
 
@@ -291,57 +346,73 @@ def run(
     local_expert_offset: int,
     routed_scaling_factor: float,
 ):
-    routing_logits = _ensure_tensor(routing_logits, "routing_logits")
-    hidden_states = _ensure_tensor(hidden_states, "hidden_states")
-    hidden_states_scale = _ensure_tensor(hidden_states_scale, "hidden_states_scale")
-    gemm1_weights = _ensure_tensor(gemm1_weights, "gemm1_weights")
-    gemm1_weights_scale = _ensure_tensor(gemm1_weights_scale, "gemm1_weights_scale")
-    gemm2_weights = _ensure_tensor(gemm2_weights, "gemm2_weights")
-    gemm2_weights_scale = _ensure_tensor(gemm2_weights_scale, "gemm2_weights_scale")
-    if routing_bias is not None:
-        routing_bias = _ensure_tensor(routing_bias, "routing_bias")
-
     output_device = hidden_states.device
+    return_to_origin = output_device.type != "cuda"
 
-    routing_logits = _to_cuda_tensor(routing_logits, "routing_logits").contiguous()
-    hidden_states = _to_cuda_tensor(hidden_states, "hidden_states").contiguous()
-    hidden_states_scale = _to_cuda_tensor(
-        hidden_states_scale, "hidden_states_scale"
-    ).contiguous()
-    gemm1_weights = _to_cuda_tensor(gemm1_weights, "gemm1_weights").contiguous()
-    gemm1_weights_scale = _to_cuda_tensor(
-        gemm1_weights_scale, "gemm1_weights_scale"
-    ).contiguous()
-    gemm2_weights = _to_cuda_tensor(gemm2_weights, "gemm2_weights").contiguous()
-    gemm2_weights_scale = _to_cuda_tensor(
-        gemm2_weights_scale, "gemm2_weights_scale"
-    ).contiguous()
-    if routing_bias is not None:
-        routing_bias = _to_cuda_tensor(routing_bias, "routing_bias").contiguous()
+    if (
+        routing_logits.device.type != "cuda"
+        or hidden_states.device.type != "cuda"
+        or hidden_states_scale.device.type != "cuda"
+        or gemm1_weights.device.type != "cuda"
+        or gemm1_weights_scale.device.type != "cuda"
+        or gemm2_weights.device.type != "cuda"
+        or gemm2_weights_scale.device.type != "cuda"
+        or (routing_bias is not None and routing_bias.device.type != "cuda")
+    ):
+        routing_logits = _as_cuda_contiguous(routing_logits, "routing_logits")
+        hidden_states = _as_cuda_contiguous(hidden_states, "hidden_states")
+        hidden_states_scale = _as_cuda_contiguous(hidden_states_scale, "hidden_states_scale")
+        gemm1_weights = _as_cuda_contiguous(gemm1_weights, "gemm1_weights")
+        gemm1_weights_scale = _as_cuda_contiguous(gemm1_weights_scale, "gemm1_weights_scale")
+        gemm2_weights = _as_cuda_contiguous(gemm2_weights, "gemm2_weights")
+        gemm2_weights_scale = _as_cuda_contiguous(gemm2_weights_scale, "gemm2_weights_scale")
+        if routing_bias is not None:
+            routing_bias = _as_cuda_contiguous(routing_bias, "routing_bias")
+    else:
+        if not routing_logits.is_contiguous():
+            routing_logits = routing_logits.contiguous()
+        if not hidden_states.is_contiguous():
+            hidden_states = hidden_states.contiguous()
+        if not hidden_states_scale.is_contiguous():
+            hidden_states_scale = hidden_states_scale.contiguous()
+        if not gemm1_weights.is_contiguous():
+            gemm1_weights = gemm1_weights.contiguous()
+        if not gemm1_weights_scale.is_contiguous():
+            gemm1_weights_scale = gemm1_weights_scale.contiguous()
+        if not gemm2_weights.is_contiguous():
+            gemm2_weights = gemm2_weights.contiguous()
+        if not gemm2_weights_scale.is_contiguous():
+            gemm2_weights_scale = gemm2_weights_scale.contiguous()
+        if routing_bias is not None and not routing_bias.is_contiguous():
+            routing_bias = routing_bias.contiguous()
 
-    local_expert_offset = _normalize_int_scalar(local_expert_offset)
-    routed_scaling_factor = _normalize_float_scalar(routed_scaling_factor)
-
-    seq_len, num_experts = routing_logits.shape
-    local_num_experts = gemm1_weights.shape[0]
-
-    assert num_experts == NUM_EXPERTS_GLOBAL
-    assert local_num_experts == NUM_LOCAL_EXPERTS
-    assert hidden_states.shape == (seq_len, HIDDEN_SIZE)
-    assert hidden_states_scale.shape == (NUM_HIDDEN_BLOCKS, seq_len)
-    assert gemm1_weights.shape == (NUM_LOCAL_EXPERTS, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE)
-    assert gemm1_weights_scale.shape == (
-        NUM_LOCAL_EXPERTS,
-        NUM_GEMM1_OUT_BLOCKS,
-        NUM_HIDDEN_BLOCKS,
+    local_expert_offset = (
+        int(local_expert_offset.item())
+        if isinstance(local_expert_offset, torch.Tensor)
+        else int(local_expert_offset)
     )
-    assert gemm2_weights.shape == (NUM_LOCAL_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
-    assert gemm2_weights_scale.shape == (
-        NUM_LOCAL_EXPERTS,
-        NUM_HIDDEN_BLOCKS,
-        NUM_INTERMEDIATE_BLOCKS,
+    routed_scaling_factor = (
+        float(routed_scaling_factor.item())
+        if isinstance(routed_scaling_factor, torch.Tensor)
+        else float(routed_scaling_factor)
     )
-    assert routing_bias is None or routing_bias.shape[-1] == NUM_EXPERTS_GLOBAL
+
+    seq_len = routing_logits.shape[0]
+
+    if seq_len <= HYBRID_FLASHINFER_MAX_SEQ or seq_len >= HYBRID_FLASHINFER_MIN_SEQ:
+        out = _run_flashinfer_path(
+            routing_logits,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights,
+            gemm2_weights_scale,
+            local_expert_offset,
+            routed_scaling_factor,
+        )
+        return out if not return_to_origin else out.to(output_device)
 
     output = torch.zeros(
         (seq_len, HIDDEN_SIZE), dtype=torch.float32, device=routing_logits.device
@@ -353,14 +424,12 @@ def run(
         local_expert_offset,
         routed_scaling_factor,
     )
-    if plan is None:
-        return output.to(torch.bfloat16).to(output_device)
-
     token_sorted, w_sorted, expert_sorted = plan
-    a = _dequant_hidden_states(hidden_states, hidden_states_scale)
-    a_cat = a.index_select(0, token_sorted).contiguous()
+    if token_sorted.numel() == 0:
+        return output.to(torch.bfloat16).to(output_device)
+    a_cat = _dequant_selected_hidden_states(hidden_states, hidden_states_scale, token_sorted)
 
-    w13_t_all, w2_t_all = _get_dequantized_weight_pack(
+    base_weight_key = _base_weight_cache_key(
         gemm1_weights,
         gemm1_weights_scale,
         gemm2_weights,
@@ -368,11 +437,24 @@ def run(
     )
     active_local_ids, counts = torch.unique_consecutive(expert_sorted, return_counts=True)
     offs = counts.cumsum(0).to(dtype=torch.int32, device=routing_logits.device).contiguous()
-    w13_t, w2_t = _get_grouped_weight_pack(w13_t_all, w2_t_all, active_local_ids)
+    active_weight_key = (
+        base_weight_key,
+        local_expert_offset,
+        tuple(int(x) for x in active_local_ids.tolist()),
+    )
+    w13_t, w2_t = _get_active_dequantized_weight_pack(
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        active_local_ids,
+        active_weight_key,
+    )
 
     g1 = torch.ops.aten._grouped_mm(a_cat, w13_t, offs)
     c = _swiglu_triton(g1)
     o = torch.ops.aten._grouped_mm(c, w2_t, offs)
     output.index_add_(0, token_sorted, o.to(torch.float32) * w_sorted.unsqueeze(1))
 
-    return output.to(torch.bfloat16).to(output_device)
+    out = output.to(torch.bfloat16)
+    return out if not return_to_origin else out.to(output_device)
