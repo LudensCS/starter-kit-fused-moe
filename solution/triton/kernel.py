@@ -340,7 +340,7 @@ def run(
     seq_len = routing_logits.shape[0]
 
     output = torch.zeros(
-        (seq_len, HIDDEN_SIZE), dtype=torch.bfloat16, device=routing_logits.device
+        (seq_len, HIDDEN_SIZE), dtype=torch.float32, device=routing_logits.device
     )
 
     plan = _build_local_plan(
@@ -351,7 +351,7 @@ def run(
     )
     token_sorted, w_sorted, expert_sorted = plan
     if token_sorted.numel() == 0:
-        return output.to(output_device)
+        return output.to(torch.bfloat16).to(output_device)
     a_cat = _dequant_selected_hidden_states(hidden_states, hidden_states_scale, token_sorted)
 
     base_weight_key = _base_weight_cache_key(
@@ -379,7 +379,7 @@ def run(
     g1 = torch.ops.aten._grouped_mm(a_cat, w13_t, offs)
     c = _swiglu_triton(g1)
     o = torch.ops.aten._grouped_mm(c, w2_t, offs)
-    output.index_add_(
-        0, token_sorted, o * w_sorted.unsqueeze(1).to(dtype=torch.bfloat16)
-    )
-    return output if not return_to_origin else output.to(output_device)
+    output.index_add_(0, token_sorted, o.to(torch.float32) * w_sorted.unsqueeze(1))
+
+    out = output.to(torch.bfloat16)
+    return out if not return_to_origin else out.to(output_device)
