@@ -73,6 +73,9 @@ Return ONLY the full, complete, and runnable code needed to execute the kernel. 
 ## 7. Prohibited Behaviors
 You are strictly prohibited from modifying the evaluation scripts (e.g., `run_local.py`) or using illegitimate techniques such as pre-caching inputs/outputs to artificially inflate the speedup metric. You do not have permission to alter the evaluation framework. You must perform genuine, low-level kernel optimizations rather than relying on deceptive shortcuts.
 
+## 8. Organizer's Evaluation Environment Description:
+The current environment already includes PyTorch, Triton, CUDA 13.1, cuTile, CuTe DSL, CUTLASS, tvm-ffi, TileLang, cuDNN, cuBLAS, NCCL, and NVSHMEM.
+
 ## PyTorch Reference:
 ```python
 import torch

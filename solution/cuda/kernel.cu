@@ -30,7 +30,8 @@ constexpr int kBlock = 128;
 constexpr int kNumHiddenBlocks = kHiddenSize / kBlock;
 constexpr int kNumIntermediateBlocks = kIntermediateSize / kBlock;
 constexpr int kNumGemm1OutBlocks = kGemm1OutSize / kBlock;
-constexpr int kNumPipelineStreams = 4;
+constexpr int kNumPipelineStreams = 1;
+constexpr int kExpertTokenAlign = 128;
 constexpr float kEps = 1.0e-20f;
 constexpr float kNegInf = -1.0e20f;
 
@@ -130,20 +131,71 @@ struct Workspace {
   }
 };
 
+uint64_t make_lt_algo_key_with_batch(int batch_count, int m, int n, int k) {
+  return (static_cast<uint64_t>(batch_count) << 56) ^ (static_cast<uint64_t>(m) << 38) ^
+         (static_cast<uint64_t>(n) << 19) ^ static_cast<uint64_t>(k);
+}
+
 uint64_t make_lt_algo_key(int m, int n, int k) {
-  return (static_cast<uint64_t>(m) << 42) ^ (static_cast<uint64_t>(n) << 21) ^
-         static_cast<uint64_t>(k);
+  return make_lt_algo_key_with_batch(1, m, n, k);
+}
+
+int align_up(int value, int alignment) {
+  return ((value + alignment - 1) / alignment) * alignment;
+}
+
+struct ExpertRun {
+  int32_t first_expert = 0;
+  int32_t batch_size = 0;
+  int32_t padded_count = 0;
+};
+
+std::vector<ExpertRun> build_expert_runs(
+    const std::vector<int32_t>& experts, const std::array<int32_t, kNumLocalExperts>& host_counts) {
+  std::vector<ExpertRun> runs;
+  if (experts.empty()) {
+    return runs;
+  }
+
+  ExpertRun run{};
+  run.first_expert = experts[0];
+  run.batch_size = 1;
+  run.padded_count = align_up(host_counts[experts[0]], kExpertTokenAlign);
+
+  for (size_t i = 1; i < experts.size(); ++i) {
+    const int32_t expert = experts[i];
+    const int32_t padded_count = align_up(host_counts[expert], kExpertTokenAlign);
+    if (expert == experts[i - 1] + 1 && padded_count == run.padded_count) {
+      ++run.batch_size;
+      continue;
+    }
+    runs.push_back(run);
+    run.first_expert = expert;
+    run.batch_size = 1;
+    run.padded_count = padded_count;
+  }
+  runs.push_back(run);
+  return runs;
 }
 
 cublasLtMatmulAlgo_t get_fp8_blockscale_algo(
-    cublasLtHandle_t handle, int m, int n, int k, size_t workspace_size, bool* supported) {
+    cublasLtHandle_t handle,
+    int batch_count,
+    int m,
+    int n,
+    int k,
+    int64_t a_batch_stride,
+    int64_t b_batch_stride,
+    int64_t d_batch_stride,
+    size_t workspace_size,
+    bool* supported) {
   struct CacheEntry {
     bool supported;
     cublasLtMatmulAlgo_t algo;
   };
   static std::unordered_map<uint64_t, CacheEntry> cache;
 
-  const uint64_t key = make_lt_algo_key(m, n, k);
+  const uint64_t key = make_lt_algo_key_with_batch(batch_count, m, n, k);
   auto it = cache.find(key);
   if (it != cache.end()) {
     *supported = it->second.supported;
@@ -184,6 +236,21 @@ cublasLtMatmulAlgo_t get_fp8_blockscale_algo(
       b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
   CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
       c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+
+  if (batch_count > 1) {
+    CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+        a_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+    CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+        b_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+    CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+        c_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+    CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+        a_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &a_batch_stride, sizeof(a_batch_stride)));
+    CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+        b_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &b_batch_stride, sizeof(b_batch_stride)));
+    CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+        c_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &d_batch_stride, sizeof(d_batch_stride)));
+  }
 
   CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
   CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
@@ -646,7 +713,124 @@ bool gemm_fp8_blockscale_rowmajor(
   CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
       pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)));
   bool supported = false;
-  cublasLtMatmulAlgo_t algo = get_fp8_blockscale_algo(handle, m, n, k, workspace_size, &supported);
+  cublasLtMatmulAlgo_t algo = get_fp8_blockscale_algo(
+      handle, 1, m, n, k, static_cast<int64_t>(m) * k, static_cast<int64_t>(n) * k,
+      static_cast<int64_t>(m) * n, workspace_size, &supported);
+  if (!supported) {
+    CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(pref));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(c_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(b_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(a_desc));
+    CUBLAS_CHECK(cublasLtMatmulDescDestroy(op_desc));
+    return false;
+  }
+
+  cublasStatus_t status = cublasLtMatmul(
+      handle,
+      op_desc,
+      &alpha,
+      a,
+      a_desc,
+      b,
+      b_desc,
+      &beta,
+      d,
+      c_desc,
+      d,
+      c_desc,
+      &algo,
+      workspace,
+      workspace_size,
+      stream);
+
+  CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(pref));
+  CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(c_desc));
+  CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(b_desc));
+  CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(a_desc));
+  CUBLAS_CHECK(cublasLtMatmulDescDestroy(op_desc));
+  return status == CUBLAS_STATUS_SUCCESS;
+}
+
+bool gemm_fp8_blockscale_rowmajor_batched(
+    cublasLtHandle_t handle,
+    cudaStream_t stream,
+    void* workspace,
+    size_t workspace_size,
+    int batch_count,
+    int m,
+    int n,
+    int k,
+    const __nv_fp8_e4m3* a,
+    const float* a_scale,
+    const __nv_fp8_e4m3* b,
+    const float* b_scale,
+    __nv_bfloat16* d) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  cublasLtMatmulDesc_t op_desc = nullptr;
+  cublasLtMatrixLayout_t a_desc = nullptr;
+  cublasLtMatrixLayout_t b_desc = nullptr;
+  cublasLtMatrixLayout_t c_desc = nullptr;
+  cublasLtMatmulPreference_t pref = nullptr;
+
+  const int64_t a_batch_stride = static_cast<int64_t>(m) * k;
+  const int64_t b_batch_stride = static_cast<int64_t>(n) * k;
+  const int64_t d_batch_stride = static_cast<int64_t>(m) * n;
+
+  CUBLAS_CHECK(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  cublasOperation_t transa = CUBLAS_OP_N;
+  cublasOperation_t transb = CUBLAS_OP_T;
+  CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+      op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+  CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+      op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+
+  cublasLtMatmulMatrixScale_t a_scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F;
+  cublasLtMatmulMatrixScale_t b_scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_BLK128x128_32F;
+  CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+      op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &a_scale_mode, sizeof(a_scale_mode)));
+  CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+      op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &b_scale_mode, sizeof(b_scale_mode)));
+  CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+      op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale, sizeof(a_scale)));
+  CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+      op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale, sizeof(b_scale)));
+
+  int8_t fast_accum = 1;
+  CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+      op_desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast_accum, sizeof(fast_accum)));
+
+  CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_8F_E4M3, m, k, k));
+  CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_8F_E4M3, n, k, k));
+  CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16BF, m, n, n));
+
+  cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+  CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+      a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+  CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+      b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+  CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+      c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+  CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+      a_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+  CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+      b_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+  CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+      c_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+  CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+      a_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &a_batch_stride, sizeof(a_batch_stride)));
+  CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+      b_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &b_batch_stride, sizeof(b_batch_stride)));
+  CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
+      c_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &d_batch_stride, sizeof(d_batch_stride)));
+
+  CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+  CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
+      pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)));
+  bool supported = false;
+  cublasLtMatmulAlgo_t algo = get_fp8_blockscale_algo(
+      handle, batch_count, m, n, k, a_batch_stride, b_batch_stride, d_batch_stride, workspace_size,
+      &supported);
   if (!supported) {
     CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(pref));
     CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(c_desc));
@@ -805,37 +989,19 @@ void launch_moe_cuda(
   auto* o_all_ptr = static_cast<__nv_bfloat16*>(ws.o_all.ptr);
   auto* output_accum_ptr = static_cast<float*>(ws.output_accum.ptr);
 
-  std::vector<int32_t> sorted_experts = active_experts;
-  std::sort(sorted_experts.begin(), sorted_experts.end(), [&](int32_t lhs, int32_t rhs) {
-    return host_counts[lhs] > host_counts[rhs];
-  });
-
   std::array<std::vector<int32_t>, kNumPipelineStreams> stream_experts;
-  std::array<int64_t, kNumPipelineStreams> stream_loads{};
+  stream_experts[0] = active_experts;
+  const auto runs = build_expert_runs(stream_experts[0], host_counts);
 
-  for (int32_t expert : sorted_experts) {
-    int best_stream = 0;
-    for (int s = 1; s < kNumPipelineStreams; ++s) {
-      if (stream_loads[s] < stream_loads[best_stream]) {
-        best_stream = s;
-      }
-    }
-    stream_experts[best_stream].push_back(expert);
-    stream_loads[best_stream] += host_counts[expert];
-  }
+  auto& pipeline = ws.pipelines[0];
+  pipeline.set_stream();
 
-  for (int s = 0; s < kNumPipelineStreams; ++s) {
-    if (stream_experts[s].empty()) {
-      continue;
-    }
-
-    auto& pipeline = ws.pipelines[s];
-    pipeline.set_stream();
-
-    for (int32_t expert : stream_experts[s]) {
+  for (const ExpertRun& run : runs) {
+    if (run.batch_size == 1) {
+      const int32_t expert = run.first_expert;
       const int32_t start = host_offsets[expert];
       const int32_t count = host_counts[expert];
-      const int32_t padded_count = (count + 3) & ~3;
+      const int32_t padded_count = run.padded_count;
 
       pipeline.a_fp8_buf.ensure(static_cast<size_t>(padded_count) * kHiddenSize * sizeof(__nv_fp8_e4m3));
       pipeline.a_scale_buf.ensure(static_cast<size_t>(kNumHiddenBlocks) * padded_count * sizeof(float));
@@ -845,61 +1011,41 @@ void launch_moe_cuda(
       auto* a_scale_ptr = static_cast<float*>(pipeline.a_scale_buf.ptr);
       auto* g1_tmp_ptr = static_cast<__nv_bfloat16*>(pipeline.g1_tmp_buf.ptr);
 
-      if (padded_count != count) {
-        CUDA_CHECK(cudaMemsetAsync(
-            a_fp8_ptr, 0, static_cast<size_t>(padded_count) * kHiddenSize * sizeof(__nv_fp8_e4m3), pipeline.stream));
-        CUDA_CHECK(cudaMemsetAsync(
-            a_scale_ptr, 0, static_cast<size_t>(kNumHiddenBlocks) * padded_count * sizeof(float), pipeline.stream));
-      }
+      CUDA_CHECK(cudaMemsetAsync(
+          a_fp8_ptr, 0, static_cast<size_t>(padded_count) * kHiddenSize * sizeof(__nv_fp8_e4m3),
+          pipeline.stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          a_scale_ptr, 0, static_cast<size_t>(kNumHiddenBlocks) * padded_count * sizeof(float),
+          pipeline.stream));
 
       dim3 gather_fp8_grid((kHiddenSize + act_block.x - 1) / act_block.x, count);
       gather_hidden_fp8_kernel<<<gather_fp8_grid, act_block, 0, pipeline.stream>>>(
-          hidden_states_ptr,
-          token_ids_ptr + start,
-          a_fp8_ptr,
-          count);
+          hidden_states_ptr, token_ids_ptr + start, a_fp8_ptr, count);
       CUDA_CHECK(cudaGetLastError());
 
       dim3 gather_scale_grid((count + 255) / 256, kNumHiddenBlocks);
       gather_hidden_scale_kernel<<<gather_scale_grid, 256, 0, pipeline.stream>>>(
-          hidden_states_scale_ptr,
-          token_ids_ptr + start,
-          a_scale_ptr,
-          count,
-          seq_len,
-          padded_count);
+          hidden_states_scale_ptr, token_ids_ptr + start, a_scale_ptr, count, seq_len, padded_count);
       CUDA_CHECK(cudaGetLastError());
 
       const auto* w13_expert_ptr =
           gemm1_weights_ptr + static_cast<int64_t>(expert) * kGemm1OutSize * kHiddenSize;
       const auto* w13_scale_expert_ptr =
           gemm1_weights_scale_ptr + static_cast<int64_t>(expert) * kNumGemm1OutBlocks * kNumHiddenBlocks;
-      auto* g1_dst_ptr = padded_count == count
-          ? (g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize)
-          : g1_tmp_ptr;
+      auto* g1_dst_ptr = padded_count == count ? (g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize)
+                                               : g1_tmp_ptr;
 
       const bool fp8_ok = gemm_fp8_blockscale_rowmajor(
-          pipeline.cublaslt,
-          pipeline.stream,
-          pipeline.lt_workspace.ptr,
-          pipeline.lt_workspace.bytes,
-          padded_count,
-          kGemm1OutSize,
-          kHiddenSize,
-          a_fp8_ptr,
-          a_scale_ptr,
-          w13_expert_ptr,
-          w13_scale_expert_ptr,
-          g1_dst_ptr);
+          pipeline.cublaslt, pipeline.stream, pipeline.lt_workspace.ptr, pipeline.lt_workspace.bytes,
+          padded_count, kGemm1OutSize, kHiddenSize, a_fp8_ptr, a_scale_ptr, w13_expert_ptr,
+          w13_scale_expert_ptr, g1_dst_ptr);
 
       if (fp8_ok) {
         if (padded_count != count) {
           CUDA_CHECK(cudaMemcpyAsync(
-              g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize,
-              g1_tmp_ptr,
+              g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize, g1_tmp_ptr,
               static_cast<size_t>(count) * kGemm1OutSize * sizeof(__nv_bfloat16),
-              cudaMemcpyDeviceToDevice,
-              pipeline.stream));
+              cudaMemcpyDeviceToDevice, pipeline.stream));
         }
       } else {
         pipeline.a_bf16_buf.ensure(static_cast<size_t>(count) * kHiddenSize * sizeof(__nv_bfloat16));
@@ -909,12 +1055,7 @@ void launch_moe_cuda(
 
         dim3 this_act_grid((kHiddenSize + act_block.x - 1) / act_block.x, count);
         dequant_hidden_kernel_strided<<<this_act_grid, act_block, 0, pipeline.stream>>>(
-            hidden_states_ptr,
-            hidden_states_scale_ptr,
-            token_ids_ptr + start,
-            a_bf16_ptr,
-            count,
-            seq_len);
+            hidden_states_ptr, hidden_states_scale_ptr, token_ids_ptr + start, a_bf16_ptr, count, seq_len);
         CUDA_CHECK(cudaGetLastError());
 
         dequant_gemm1_weight_kernel<<<g1_weight_grid, g1_weight_block, 0, pipeline.stream>>>(
@@ -922,25 +1063,123 @@ void launch_moe_cuda(
         CUDA_CHECK(cudaGetLastError());
 
         gemm_bf16_rowmajor(
-            pipeline.cublas,
-            count,
-            kGemm1OutSize,
-            kHiddenSize,
-            a_bf16_ptr,
-            w13_bf16_ptr,
+            pipeline.cublas, count, kGemm1OutSize, kHiddenSize, a_bf16_ptr, w13_bf16_ptr,
             g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize);
       }
-
+      continue;
     }
 
-    CUDA_CHECK(cudaEventRecord(pipeline.done_event, pipeline.stream));
-  }
+    const int32_t padded_count = run.padded_count;
+    const int32_t batch_size = run.batch_size;
+    const int32_t first_expert = run.first_expert;
 
-  for (int s = 0; s < kNumPipelineStreams; ++s) {
-    if (!stream_experts[s].empty()) {
-      CUDA_CHECK(cudaStreamWaitEvent(stream, ws.pipelines[s].done_event, 0));
+    pipeline.a_fp8_buf.ensure(
+        static_cast<size_t>(batch_size) * padded_count * kHiddenSize * sizeof(__nv_fp8_e4m3));
+    pipeline.a_scale_buf.ensure(
+        static_cast<size_t>(batch_size) * kNumHiddenBlocks * padded_count * sizeof(float));
+    pipeline.g1_tmp_buf.ensure(
+        static_cast<size_t>(batch_size) * padded_count * kGemm1OutSize * sizeof(__nv_bfloat16));
+
+    auto* a_fp8_ptr = static_cast<__nv_fp8_e4m3*>(pipeline.a_fp8_buf.ptr);
+    auto* a_scale_ptr = static_cast<float*>(pipeline.a_scale_buf.ptr);
+    auto* g1_tmp_ptr = static_cast<__nv_bfloat16*>(pipeline.g1_tmp_buf.ptr);
+
+    CUDA_CHECK(cudaMemsetAsync(
+        a_fp8_ptr,
+        0,
+        static_cast<size_t>(batch_size) * padded_count * kHiddenSize * sizeof(__nv_fp8_e4m3),
+        pipeline.stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        a_scale_ptr,
+        0,
+        static_cast<size_t>(batch_size) * kNumHiddenBlocks * padded_count * sizeof(float),
+        pipeline.stream));
+
+    for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+      const int32_t expert = first_expert + batch_idx;
+      const int32_t start = host_offsets[expert];
+      const int32_t count = host_counts[expert];
+
+      dim3 gather_fp8_grid((kHiddenSize + act_block.x - 1) / act_block.x, count);
+      gather_hidden_fp8_kernel<<<gather_fp8_grid, act_block, 0, pipeline.stream>>>(
+          hidden_states_ptr,
+          token_ids_ptr + start,
+          a_fp8_ptr + static_cast<int64_t>(batch_idx) * padded_count * kHiddenSize,
+          count);
+      CUDA_CHECK(cudaGetLastError());
+
+      dim3 gather_scale_grid((count + 255) / 256, kNumHiddenBlocks);
+      gather_hidden_scale_kernel<<<gather_scale_grid, 256, 0, pipeline.stream>>>(
+          hidden_states_scale_ptr,
+          token_ids_ptr + start,
+          a_scale_ptr + static_cast<int64_t>(batch_idx) * kNumHiddenBlocks * padded_count,
+          count,
+          seq_len,
+          padded_count);
+      CUDA_CHECK(cudaGetLastError());
+    }
+
+    const auto* w13_expert_ptr =
+        gemm1_weights_ptr + static_cast<int64_t>(first_expert) * kGemm1OutSize * kHiddenSize;
+    const auto* w13_scale_expert_ptr =
+        gemm1_weights_scale_ptr +
+        static_cast<int64_t>(first_expert) * kNumGemm1OutBlocks * kNumHiddenBlocks;
+
+    const bool fp8_ok = gemm_fp8_blockscale_rowmajor_batched(
+        pipeline.cublaslt,
+        pipeline.stream,
+        pipeline.lt_workspace.ptr,
+        pipeline.lt_workspace.bytes,
+        batch_size,
+        padded_count,
+        kGemm1OutSize,
+        kHiddenSize,
+        a_fp8_ptr,
+        a_scale_ptr,
+        w13_expert_ptr,
+        w13_scale_expert_ptr,
+        g1_tmp_ptr);
+
+    if (fp8_ok) {
+      for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        const int32_t expert = first_expert + batch_idx;
+        const int32_t start = host_offsets[expert];
+        const int32_t count = host_counts[expert];
+        CUDA_CHECK(cudaMemcpyAsync(
+            g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize,
+            g1_tmp_ptr + static_cast<int64_t>(batch_idx) * padded_count * kGemm1OutSize,
+            static_cast<size_t>(count) * kGemm1OutSize * sizeof(__nv_bfloat16),
+            cudaMemcpyDeviceToDevice,
+            pipeline.stream));
+      }
+    } else {
+      for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        const int32_t expert = first_expert + batch_idx;
+        const int32_t start = host_offsets[expert];
+        const int32_t count = host_counts[expert];
+        pipeline.a_bf16_buf.ensure(static_cast<size_t>(count) * kHiddenSize * sizeof(__nv_bfloat16));
+        pipeline.w13_buf.ensure(static_cast<size_t>(kGemm1OutSize) * kHiddenSize * sizeof(__nv_bfloat16));
+        auto* a_bf16_ptr = static_cast<__nv_bfloat16*>(pipeline.a_bf16_buf.ptr);
+        auto* w13_bf16_ptr = static_cast<__nv_bfloat16*>(pipeline.w13_buf.ptr);
+
+        dim3 this_act_grid((kHiddenSize + act_block.x - 1) / act_block.x, count);
+        dequant_hidden_kernel_strided<<<this_act_grid, act_block, 0, pipeline.stream>>>(
+            hidden_states_ptr, hidden_states_scale_ptr, token_ids_ptr + start, a_bf16_ptr, count, seq_len);
+        CUDA_CHECK(cudaGetLastError());
+
+        dequant_gemm1_weight_kernel<<<g1_weight_grid, g1_weight_block, 0, pipeline.stream>>>(
+            gemm1_weights_ptr, gemm1_weights_scale_ptr, w13_bf16_ptr, expert);
+        CUDA_CHECK(cudaGetLastError());
+
+        gemm_bf16_rowmajor(
+            pipeline.cublas, count, kGemm1OutSize, kHiddenSize, a_bf16_ptr, w13_bf16_ptr,
+            g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize);
+      }
     }
   }
+
+  CUDA_CHECK(cudaEventRecord(pipeline.done_event, pipeline.stream));
+  CUDA_CHECK(cudaStreamWaitEvent(stream, pipeline.done_event, 0));
 
   dim3 all_pairs_act_grid((kHiddenSize + act_block.x - 1) / act_block.x, total_pairs);
   dim3 all_pairs_swiglu_grid((kIntermediateSize + swiglu_block.x - 1) / swiglu_block.x, total_pairs);
@@ -948,20 +1187,15 @@ void launch_moe_cuda(
   CUDA_CHECK(cudaGetLastError());
 
   CUDA_CHECK(cudaEventRecord(ws.route_ready_event, stream));
+  pipeline.set_stream();
+  CUDA_CHECK(cudaStreamWaitEvent(pipeline.stream, ws.route_ready_event, 0));
 
-  for (int s = 0; s < kNumPipelineStreams; ++s) {
-    if (stream_experts[s].empty()) {
-      continue;
-    }
-
-    auto& pipeline = ws.pipelines[s];
-    pipeline.set_stream();
-    CUDA_CHECK(cudaStreamWaitEvent(pipeline.stream, ws.route_ready_event, 0));
-
-    for (int32_t expert : stream_experts[s]) {
+  for (const ExpertRun& run : runs) {
+    if (run.batch_size == 1) {
+      const int32_t expert = run.first_expert;
       const int32_t start = host_offsets[expert];
       const int32_t count = host_counts[expert];
-      const int32_t padded_count = (count + 3) & ~3;
+      const int32_t padded_count = run.padded_count;
 
       pipeline.c_fp8_buf.ensure(
           static_cast<size_t>(padded_count) * kIntermediateSize * sizeof(__nv_fp8_e4m3));
@@ -974,12 +1208,12 @@ void launch_moe_cuda(
       auto* c_scale_ptr = static_cast<float*>(pipeline.c_scale_buf.ptr);
       auto* o_tmp_ptr = static_cast<__nv_bfloat16*>(pipeline.o_tmp_buf.ptr);
 
-      if (padded_count != count) {
-        CUDA_CHECK(cudaMemsetAsync(
-            c_fp8_ptr, 0, static_cast<size_t>(padded_count) * kIntermediateSize * sizeof(__nv_fp8_e4m3), pipeline.stream));
-        CUDA_CHECK(cudaMemsetAsync(
-            c_scale_ptr, 0, static_cast<size_t>(kNumIntermediateBlocks) * padded_count * sizeof(float), pipeline.stream));
-      }
+      CUDA_CHECK(cudaMemsetAsync(
+          c_fp8_ptr, 0, static_cast<size_t>(padded_count) * kIntermediateSize * sizeof(__nv_fp8_e4m3),
+          pipeline.stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          c_scale_ptr, 0, static_cast<size_t>(kNumIntermediateBlocks) * padded_count * sizeof(float),
+          pipeline.stream));
 
       dim3 quant_grid(kNumIntermediateBlocks, count);
       quantize_bf16_to_fp8_block128_kernel<<<quant_grid, kBlock, 0, pipeline.stream>>>(
@@ -995,32 +1229,20 @@ void launch_moe_cuda(
           gemm2_weights_ptr + static_cast<int64_t>(expert) * kHiddenSize * kIntermediateSize;
       const auto* w2_scale_expert_ptr =
           gemm2_weights_scale_ptr + static_cast<int64_t>(expert) * kNumHiddenBlocks * kNumIntermediateBlocks;
-      auto* o_dst_ptr = padded_count == count
-          ? (o_all_ptr + static_cast<int64_t>(start) * kHiddenSize)
-          : o_tmp_ptr;
+      auto* o_dst_ptr = padded_count == count ? (o_all_ptr + static_cast<int64_t>(start) * kHiddenSize)
+                                              : o_tmp_ptr;
 
       const bool fp8_ok = gemm_fp8_blockscale_rowmajor(
-          pipeline.cublaslt,
-          pipeline.stream,
-          pipeline.lt_workspace.ptr,
-          pipeline.lt_workspace.bytes,
-          padded_count,
-          kHiddenSize,
-          kIntermediateSize,
-          c_fp8_ptr,
-          c_scale_ptr,
-          w2_expert_ptr,
-          w2_scale_expert_ptr,
-          o_dst_ptr);
+          pipeline.cublaslt, pipeline.stream, pipeline.lt_workspace.ptr, pipeline.lt_workspace.bytes,
+          padded_count, kHiddenSize, kIntermediateSize, c_fp8_ptr, c_scale_ptr, w2_expert_ptr,
+          w2_scale_expert_ptr, o_dst_ptr);
 
       if (fp8_ok) {
         if (padded_count != count) {
           CUDA_CHECK(cudaMemcpyAsync(
-              o_all_ptr + static_cast<int64_t>(start) * kHiddenSize,
-              o_tmp_ptr,
+              o_all_ptr + static_cast<int64_t>(start) * kHiddenSize, o_tmp_ptr,
               static_cast<size_t>(count) * kHiddenSize * sizeof(__nv_bfloat16),
-              cudaMemcpyDeviceToDevice,
-              pipeline.stream));
+              cudaMemcpyDeviceToDevice, pipeline.stream));
         }
       } else {
         pipeline.w2_buf.ensure(static_cast<size_t>(kHiddenSize) * kIntermediateSize * sizeof(__nv_bfloat16));
@@ -1030,25 +1252,108 @@ void launch_moe_cuda(
         CUDA_CHECK(cudaGetLastError());
 
         gemm_bf16_rowmajor(
-            pipeline.cublas,
-            count,
-            kHiddenSize,
-            kIntermediateSize,
-            c_all_ptr + static_cast<int64_t>(start) * kIntermediateSize,
-            w2_bf16_ptr,
+            pipeline.cublas, count, kHiddenSize, kIntermediateSize,
+            c_all_ptr + static_cast<int64_t>(start) * kIntermediateSize, w2_bf16_ptr,
             o_all_ptr + static_cast<int64_t>(start) * kHiddenSize);
       }
-
+      continue;
     }
 
-    CUDA_CHECK(cudaEventRecord(pipeline.done_event, pipeline.stream));
-  }
+    const int32_t padded_count = run.padded_count;
+    const int32_t batch_size = run.batch_size;
+    const int32_t first_expert = run.first_expert;
 
-  for (int s = 0; s < kNumPipelineStreams; ++s) {
-    if (!stream_experts[s].empty()) {
-      CUDA_CHECK(cudaStreamWaitEvent(stream, ws.pipelines[s].done_event, 0));
+    pipeline.c_fp8_buf.ensure(
+        static_cast<size_t>(batch_size) * padded_count * kIntermediateSize * sizeof(__nv_fp8_e4m3));
+    pipeline.c_scale_buf.ensure(
+        static_cast<size_t>(batch_size) * kNumIntermediateBlocks * padded_count * sizeof(float));
+    pipeline.o_tmp_buf.ensure(
+        static_cast<size_t>(batch_size) * padded_count * kHiddenSize * sizeof(__nv_bfloat16));
+
+    auto* c_fp8_ptr = static_cast<__nv_fp8_e4m3*>(pipeline.c_fp8_buf.ptr);
+    auto* c_scale_ptr = static_cast<float*>(pipeline.c_scale_buf.ptr);
+    auto* o_tmp_ptr = static_cast<__nv_bfloat16*>(pipeline.o_tmp_buf.ptr);
+
+    CUDA_CHECK(cudaMemsetAsync(
+        c_fp8_ptr,
+        0,
+        static_cast<size_t>(batch_size) * padded_count * kIntermediateSize * sizeof(__nv_fp8_e4m3),
+        pipeline.stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        c_scale_ptr,
+        0,
+        static_cast<size_t>(batch_size) * kNumIntermediateBlocks * padded_count * sizeof(float),
+        pipeline.stream));
+
+    for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+      const int32_t expert = first_expert + batch_idx;
+      const int32_t start = host_offsets[expert];
+      const int32_t count = host_counts[expert];
+      dim3 quant_grid(kNumIntermediateBlocks, count);
+      quantize_bf16_to_fp8_block128_kernel<<<quant_grid, kBlock, 0, pipeline.stream>>>(
+          c_all_ptr + static_cast<int64_t>(start) * kIntermediateSize,
+          c_fp8_ptr + static_cast<int64_t>(batch_idx) * padded_count * kIntermediateSize,
+          c_scale_ptr + static_cast<int64_t>(batch_idx) * kNumIntermediateBlocks * padded_count,
+          count,
+          padded_count,
+          kIntermediateSize);
+      CUDA_CHECK(cudaGetLastError());
+    }
+
+    const auto* w2_expert_ptr =
+        gemm2_weights_ptr + static_cast<int64_t>(first_expert) * kHiddenSize * kIntermediateSize;
+    const auto* w2_scale_expert_ptr =
+        gemm2_weights_scale_ptr +
+        static_cast<int64_t>(first_expert) * kNumHiddenBlocks * kNumIntermediateBlocks;
+
+    const bool fp8_ok = gemm_fp8_blockscale_rowmajor_batched(
+        pipeline.cublaslt,
+        pipeline.stream,
+        pipeline.lt_workspace.ptr,
+        pipeline.lt_workspace.bytes,
+        batch_size,
+        padded_count,
+        kHiddenSize,
+        kIntermediateSize,
+        c_fp8_ptr,
+        c_scale_ptr,
+        w2_expert_ptr,
+        w2_scale_expert_ptr,
+        o_tmp_ptr);
+
+    if (fp8_ok) {
+      for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        const int32_t expert = first_expert + batch_idx;
+        const int32_t start = host_offsets[expert];
+        const int32_t count = host_counts[expert];
+        CUDA_CHECK(cudaMemcpyAsync(
+            o_all_ptr + static_cast<int64_t>(start) * kHiddenSize,
+            o_tmp_ptr + static_cast<int64_t>(batch_idx) * padded_count * kHiddenSize,
+            static_cast<size_t>(count) * kHiddenSize * sizeof(__nv_bfloat16),
+            cudaMemcpyDeviceToDevice,
+            pipeline.stream));
+      }
+    } else {
+      for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        const int32_t expert = first_expert + batch_idx;
+        const int32_t start = host_offsets[expert];
+        const int32_t count = host_counts[expert];
+        pipeline.w2_buf.ensure(static_cast<size_t>(kHiddenSize) * kIntermediateSize * sizeof(__nv_bfloat16));
+        auto* w2_bf16_ptr = static_cast<__nv_bfloat16*>(pipeline.w2_buf.ptr);
+        dequant_gemm2_weight_kernel<<<g2_weight_grid, g2_weight_block, 0, pipeline.stream>>>(
+            gemm2_weights_ptr, gemm2_weights_scale_ptr, w2_bf16_ptr, expert);
+        CUDA_CHECK(cudaGetLastError());
+
+        gemm_bf16_rowmajor(
+            pipeline.cublas, count, kHiddenSize, kIntermediateSize,
+            c_all_ptr + static_cast<int64_t>(start) * kIntermediateSize, w2_bf16_ptr,
+            o_all_ptr + static_cast<int64_t>(start) * kHiddenSize);
+      }
     }
   }
+
+  CUDA_CHECK(cudaEventRecord(pipeline.done_event, pipeline.stream));
+  CUDA_CHECK(cudaStreamWaitEvent(stream, pipeline.done_event, 0));
 
   accumulate_kernel<<<all_pairs_act_grid, act_block, 0, stream>>>(
       token_ids_ptr,
