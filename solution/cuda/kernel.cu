@@ -30,7 +30,7 @@ constexpr int kBlock = 128;
 constexpr int kNumHiddenBlocks = kHiddenSize / kBlock;
 constexpr int kNumIntermediateBlocks = kIntermediateSize / kBlock;
 constexpr int kNumGemm1OutBlocks = kGemm1OutSize / kBlock;
-constexpr int kNumPipelineStreams = 1;
+constexpr int kNumPipelineStreams = 4;
 constexpr int kExpertTokenAlign = 128;
 constexpr float kEps = 1.0e-20f;
 constexpr float kNegInf = -1.0e20f;
@@ -76,6 +76,9 @@ struct ExpertPipeline {
   DeviceBuffer w2_buf;
   DeviceBuffer o_tmp_buf;
   DeviceBuffer lt_workspace;
+  DeviceBuffer expert_ids_buf;
+  DeviceBuffer expert_starts_buf;
+  DeviceBuffer expert_counts_buf;
   cudaStream_t stream = nullptr;
   cudaEvent_t done_event = nullptr;
   cublasHandle_t cublas = nullptr;
@@ -105,15 +108,14 @@ struct ExpertPipeline {
 struct Workspace {
   DeviceBuffer local_ids;
   DeviceBuffer local_weights;
+  DeviceBuffer pair_rows;
   DeviceBuffer counts;
   DeviceBuffer write_offsets;
   DeviceBuffer token_ids;
-  DeviceBuffer pair_weights;
   DeviceBuffer a_all;
   DeviceBuffer g1_all;
   DeviceBuffer c_all;
   DeviceBuffer o_all;
-  DeviceBuffer output_accum;
   cudaEvent_t route_ready_event = nullptr;
   bool route_ready_event_initialized = false;
   std::array<ExpertPipeline, kNumPipelineStreams> pipelines;
@@ -147,7 +149,7 @@ int align_up(int value, int alignment) {
 struct ExpertRun {
   int32_t first_expert = 0;
   int32_t batch_size = 0;
-  int32_t padded_count = 0;
+  int32_t token_count = 0;
 };
 
 std::vector<ExpertRun> build_expert_runs(
@@ -158,21 +160,21 @@ std::vector<ExpertRun> build_expert_runs(
   }
 
   ExpertRun run{};
-  run.first_expert = experts[0];
+  run.first_expert = experts.front();
   run.batch_size = 1;
-  run.padded_count = align_up(host_counts[experts[0]], kExpertTokenAlign);
+  run.token_count = host_counts[experts.front()];
 
   for (size_t i = 1; i < experts.size(); ++i) {
     const int32_t expert = experts[i];
-    const int32_t padded_count = align_up(host_counts[expert], kExpertTokenAlign);
-    if (expert == experts[i - 1] + 1 && padded_count == run.padded_count) {
+    const int32_t token_count = host_counts[expert];
+    if (token_count == run.token_count) {
       ++run.batch_size;
       continue;
     }
     runs.push_back(run);
     run.first_expert = expert;
     run.batch_size = 1;
-    run.padded_count = padded_count;
+    run.token_count = token_count;
   }
   runs.push_back(run);
   return runs;
@@ -402,10 +404,9 @@ __global__ void routing_pass1_kernel(
 
 __global__ void routing_pass2_kernel(
     const int32_t* local_ids,
-    const float* local_weights,
     int32_t* write_offsets,
     int32_t* token_ids,
-    float* pair_weights,
+    int32_t* pair_rows,
     int32_t seq_len) {
   int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (token_idx >= seq_len) {
@@ -413,15 +414,16 @@ __global__ void routing_pass2_kernel(
   }
 
   const int32_t* ids_ptr = local_ids + static_cast<int64_t>(token_idx) * kTopK;
-  const float* weights_ptr = local_weights + static_cast<int64_t>(token_idx) * kTopK;
+  int32_t* rows_ptr = pair_rows + static_cast<int64_t>(token_idx) * kTopK;
 
   #pragma unroll
   for (int i = 0; i < kTopK; ++i) {
+    rows_ptr[i] = -1;
     const int local_expert = ids_ptr[i];
     if (local_expert >= 0) {
       const int pos = atomicAdd(write_offsets + local_expert, 1);
       token_ids[pos] = token_idx;
-      pair_weights[pos] = weights_ptr[i];
+      rows_ptr[i] = pos;
     }
   }
 }
@@ -465,6 +467,31 @@ __global__ void dequant_hidden_kernel_strided(
   output[static_cast<int64_t>(token_row) * kHiddenSize + hidden_col] = __float2bfloat16(val * scale);
 }
 
+__global__ void dequant_hidden_packed_kernel(
+    const __nv_fp8_e4m3* hidden_states,
+    const float* hidden_states_scale,
+    const int32_t* token_ids,
+    const int32_t* starts,
+    const int32_t* counts,
+    __nv_bfloat16* output,
+    int32_t scale_stride) {
+  const int32_t batch_idx = blockIdx.z;
+  const int32_t row = blockIdx.y;
+  const int32_t hidden_col = blockIdx.x * blockDim.x + threadIdx.x;
+  const int32_t count = counts[batch_idx];
+  if (row >= count || hidden_col >= kHiddenSize) {
+    return;
+  }
+
+  const int32_t start = starts[batch_idx];
+  const int32_t token_idx = token_ids[start + row];
+  const int32_t out_row = start + row;
+  const int32_t scale_block = hidden_col / kBlock;
+  const float scale = hidden_states_scale[static_cast<int64_t>(scale_block) * scale_stride + token_idx];
+  const float val = static_cast<float>(hidden_states[static_cast<int64_t>(token_idx) * kHiddenSize + hidden_col]);
+  output[static_cast<int64_t>(out_row) * kHiddenSize + hidden_col] = __float2bfloat16(val * scale);
+}
+
 __global__ void gather_hidden_fp8_kernel(
     const __nv_fp8_e4m3* hidden_states,
     const int32_t* token_ids,
@@ -493,7 +520,7 @@ __global__ void gather_hidden_scale_kernel(
     return;
   }
   const int32_t token_idx = token_ids[token_row];
-  output[static_cast<int64_t>(scale_block) * output_stride + token_row] =
+  output[static_cast<int64_t>(token_row) * output_stride + scale_block] =
       hidden_states_scale[static_cast<int64_t>(scale_block) * scale_stride + token_idx];
 }
 
@@ -519,6 +546,31 @@ __global__ void dequant_gemm1_weight_kernel(
   output[static_cast<int64_t>(out_col) * kHiddenSize + hidden_col] = __float2bfloat16(val * scale);
 }
 
+__global__ void dequant_gemm1_weight_batched_kernel(
+    const __nv_fp8_e4m3* gemm1_weights,
+    const float* gemm1_weights_scale,
+    const int32_t* expert_ids,
+    __nv_bfloat16* output) {
+  const int32_t batch_idx = blockIdx.z;
+  const int32_t hidden_col = blockIdx.x * blockDim.x + threadIdx.x;
+  const int32_t out_col = blockIdx.y * blockDim.y + threadIdx.y;
+  if (hidden_col >= kHiddenSize || out_col >= kGemm1OutSize) {
+    return;
+  }
+
+  const int32_t local_expert = expert_ids[batch_idx];
+  const int32_t scale_n = out_col / kBlock;
+  const int32_t scale_k = hidden_col / kBlock;
+  const int64_t weight_offset =
+      (static_cast<int64_t>(local_expert) * kGemm1OutSize + out_col) * kHiddenSize + hidden_col;
+  const int64_t scale_offset =
+      (static_cast<int64_t>(local_expert) * kNumGemm1OutBlocks + scale_n) * kNumHiddenBlocks + scale_k;
+  const float scale = gemm1_weights_scale[scale_offset];
+  const float val = static_cast<float>(gemm1_weights[weight_offset]);
+  output[(static_cast<int64_t>(batch_idx) * kGemm1OutSize + out_col) * kHiddenSize + hidden_col] =
+      __float2bfloat16(val * scale);
+}
+
 __global__ void dequant_gemm2_weight_kernel(
     const __nv_fp8_e4m3* gemm2_weights,
     const float* gemm2_weights_scale,
@@ -541,6 +593,31 @@ __global__ void dequant_gemm2_weight_kernel(
   output[static_cast<int64_t>(out_row) * kIntermediateSize + inter_col] = __float2bfloat16(val * scale);
 }
 
+__global__ void dequant_gemm2_weight_batched_kernel(
+    const __nv_fp8_e4m3* gemm2_weights,
+    const float* gemm2_weights_scale,
+    const int32_t* expert_ids,
+    __nv_bfloat16* output) {
+  const int32_t batch_idx = blockIdx.z;
+  const int32_t inter_col = blockIdx.x * blockDim.x + threadIdx.x;
+  const int32_t out_row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (inter_col >= kIntermediateSize || out_row >= kHiddenSize) {
+    return;
+  }
+
+  const int32_t local_expert = expert_ids[batch_idx];
+  const int32_t scale_h = out_row / kBlock;
+  const int32_t scale_i = inter_col / kBlock;
+  const int64_t weight_offset =
+      (static_cast<int64_t>(local_expert) * kHiddenSize + out_row) * kIntermediateSize + inter_col;
+  const int64_t scale_offset =
+      (static_cast<int64_t>(local_expert) * kNumHiddenBlocks + scale_h) * kNumIntermediateBlocks + scale_i;
+  const float scale = gemm2_weights_scale[scale_offset];
+  const float val = static_cast<float>(gemm2_weights[weight_offset]);
+  output[(static_cast<int64_t>(batch_idx) * kHiddenSize + out_row) * kIntermediateSize + inter_col] =
+      __float2bfloat16(val * scale);
+}
+
 __global__ void swiglu_kernel(
     const __nv_bfloat16* g1,
     __nv_bfloat16* c,
@@ -557,6 +634,7 @@ __global__ void swiglu_kernel(
   const float silu = x2 / (1.0f + expf(-x2));
   c[static_cast<int64_t>(row) * kIntermediateSize + col] = __float2bfloat16(x1 * silu);
 }
+
 
 __global__ void quantize_bf16_to_fp8_block128_kernel(
     const __nv_bfloat16* input,
@@ -589,36 +667,37 @@ __global__ void quantize_bf16_to_fp8_block128_kernel(
   const float abs_max = shared_abs_max;
   const float scale = abs_max > 0.0f ? abs_max / 448.0f : 1.0f;
   if (lane == 0) {
-    scales[static_cast<int64_t>(block_col) * output_stride + row] = scale;
+    scales[static_cast<int64_t>(row) * output_stride + block_col] = scale;
   }
   const float inv_scale = abs_max > 0.0f ? 1.0f / scale : 0.0f;
   output[static_cast<int64_t>(row) * width + col] = static_cast<__nv_fp8_e4m3>(val * inv_scale);
 }
 
-__global__ void accumulate_kernel(
-    const int32_t* token_ids,
-    const float* pair_weights,
+__global__ void finalize_output_kernel(
+    const float* local_weights,
+    const int32_t* pair_rows,
     const __nv_bfloat16* expert_out,
-    float* output_accum,
-    int32_t count) {
+    __nv_bfloat16* output,
+    int32_t seq_len) {
   const int row = blockIdx.y;
   const int col = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= count || col >= kHiddenSize) {
+  if (row >= seq_len || col >= kHiddenSize) {
     return;
   }
 
-  const int token_idx = token_ids[row];
-  const float weight = pair_weights[row];
-  const float val = __bfloat162float(expert_out[static_cast<int64_t>(row) * kHiddenSize + col]);
-  atomicAdd(output_accum + static_cast<int64_t>(token_idx) * kHiddenSize + col, val * weight);
-}
-
-__global__ void cast_output_kernel(const float* input, __nv_bfloat16* output, int32_t total) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total) {
-    return;
+  const float* weights_ptr = local_weights + static_cast<int64_t>(row) * kTopK;
+  const int32_t* rows_ptr = pair_rows + static_cast<int64_t>(row) * kTopK;
+  float acc = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < kTopK; ++i) {
+    const int32_t packed_row = rows_ptr[i];
+    if (packed_row >= 0) {
+      const float weight = weights_ptr[i];
+      const float val = __bfloat162float(expert_out[static_cast<int64_t>(packed_row) * kHiddenSize + col]);
+      acc += val * weight;
+    }
   }
-  output[idx] = __float2bfloat16(input[idx]);
+  output[static_cast<int64_t>(row) * kHiddenSize + col] = __float2bfloat16(acc);
 }
 
 void gemm_bf16_rowmajor(
@@ -649,6 +728,63 @@ void gemm_bf16_rowmajor(
       c,
       CUDA_R_16BF,
       n,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+void gemm_bf16_rowmajor_strided_batched(
+    cublasHandle_t handle,
+    int m,
+    int n,
+    int k,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    __nv_bfloat16* c,
+    int batch_count) {
+  if (batch_count == 0) {
+    return;
+  }
+  if (batch_count == 1 || m <= 4) {
+    const int64_t a_stride = static_cast<int64_t>(m) * k;
+    const int64_t b_stride = static_cast<int64_t>(n) * k;
+    const int64_t c_stride = static_cast<int64_t>(m) * n;
+    for (int i = 0; i < batch_count; ++i) {
+      gemm_bf16_rowmajor(
+          handle,
+          m,
+          n,
+          k,
+          a + i * a_stride,
+          b + i * b_stride,
+          c + i * c_stride);
+    }
+    return;
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+      handle,
+      CUBLAS_OP_T,
+      CUBLAS_OP_N,
+      n,
+      m,
+      k,
+      &alpha,
+      b,
+      CUDA_R_16BF,
+      k,
+      static_cast<int64_t>(n) * k,
+      a,
+      CUDA_R_16BF,
+      k,
+      static_cast<int64_t>(m) * k,
+      &beta,
+      c,
+      CUDA_R_16BF,
+      n,
+      static_cast<int64_t>(m) * n,
+      batch_count,
       CUBLAS_COMPUTE_32F,
       CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
@@ -902,9 +1038,9 @@ void launch_moe_cuda(
 
   ws.local_ids.ensure(static_cast<size_t>(seq_len) * kTopK * sizeof(int32_t));
   ws.local_weights.ensure(static_cast<size_t>(seq_len) * kTopK * sizeof(float));
+  ws.pair_rows.ensure(static_cast<size_t>(seq_len) * kTopK * sizeof(int32_t));
   ws.counts.ensure(kNumLocalExperts * sizeof(int32_t));
   ws.write_offsets.ensure(kNumLocalExperts * sizeof(int32_t));
-  ws.output_accum.ensure(static_cast<size_t>(seq_len) * kHiddenSize * sizeof(float));
 
   CUDA_CHECK(cudaMemsetAsync(ws.counts.ptr, 0, kNumLocalExperts * sizeof(int32_t), stream));
   const int threads = 128;
@@ -929,11 +1065,9 @@ void launch_moe_cuda(
       stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  std::array<int32_t, kNumLocalExperts> host_offsets{};
   std::vector<int32_t> active_experts;
   int32_t total_pairs = 0;
   for (int e = 0; e < kNumLocalExperts; ++e) {
-    host_offsets[e] = total_pairs;
     const int32_t count = host_counts[e];
     if (count > 0) {
       active_experts.push_back(e);
@@ -947,10 +1081,38 @@ void launch_moe_cuda(
   }
 
   ws.token_ids.ensure(static_cast<size_t>(total_pairs) * sizeof(int32_t));
-  ws.pair_weights.ensure(static_cast<size_t>(total_pairs) * sizeof(float));
+  ws.a_all.ensure(static_cast<size_t>(total_pairs) * kHiddenSize * sizeof(__nv_bfloat16));
   ws.g1_all.ensure(static_cast<size_t>(total_pairs) * kGemm1OutSize * sizeof(__nv_bfloat16));
   ws.c_all.ensure(static_cast<size_t>(total_pairs) * kIntermediateSize * sizeof(__nv_bfloat16));
   ws.o_all.ensure(static_cast<size_t>(total_pairs) * kHiddenSize * sizeof(__nv_bfloat16));
+
+  std::vector<int32_t> sorted_experts = active_experts;
+  std::sort(sorted_experts.begin(), sorted_experts.end(), [&](int32_t lhs, int32_t rhs) {
+    return host_counts[lhs] > host_counts[rhs];
+  });
+
+  std::array<std::vector<int32_t>, kNumPipelineStreams> stream_experts;
+  std::array<int64_t, kNumPipelineStreams> stream_loads{};
+
+  for (int32_t expert : sorted_experts) {
+    int best_stream = 0;
+    for (int s = 1; s < kNumPipelineStreams; ++s) {
+      if (stream_loads[s] < stream_loads[best_stream]) {
+        best_stream = s;
+      }
+    }
+    stream_experts[best_stream].push_back(expert);
+    stream_loads[best_stream] += host_counts[expert];
+  }
+
+  std::array<int32_t, kNumLocalExperts> host_offsets{};
+  int32_t packed_offset = 0;
+  for (int s = 0; s < kNumPipelineStreams; ++s) {
+    for (int32_t expert : stream_experts[s]) {
+      host_offsets[expert] = packed_offset;
+      packed_offset += host_counts[expert];
+    }
+  }
 
   CUDA_CHECK(cudaMemcpyAsync(
       ws.write_offsets.ptr,
@@ -961,15 +1123,12 @@ void launch_moe_cuda(
 
   routing_pass2_kernel<<<blocks, threads, 0, stream>>>(
       static_cast<const int32_t*>(ws.local_ids.ptr),
-      static_cast<const float*>(ws.local_weights.ptr),
       static_cast<int32_t*>(ws.write_offsets.ptr),
       static_cast<int32_t*>(ws.token_ids.ptr),
-      static_cast<float*>(ws.pair_weights.ptr),
+      static_cast<int32_t*>(ws.pair_rows.ptr),
       seq_len);
   CUDA_CHECK(cudaGetLastError());
-
-  CUDA_CHECK(cudaMemsetAsync(
-      ws.output_accum.ptr, 0, static_cast<size_t>(seq_len) * kHiddenSize * sizeof(float), stream));
+  CUDA_CHECK(cudaEventRecord(ws.route_ready_event, stream));
 
   dim3 act_block(256);
   dim3 g1_weight_block(16, 16);
@@ -983,388 +1142,169 @@ void launch_moe_cuda(
   dim3 swiglu_block(256);
 
   auto* token_ids_ptr = static_cast<const int32_t*>(ws.token_ids.ptr);
-  auto* pair_weights_ptr = static_cast<const float*>(ws.pair_weights.ptr);
+  auto* local_weights_ptr = static_cast<const float*>(ws.local_weights.ptr);
+  auto* pair_rows_ptr = static_cast<const int32_t*>(ws.pair_rows.ptr);
+  auto* a_all_ptr = static_cast<__nv_bfloat16*>(ws.a_all.ptr);
   auto* g1_all_ptr = static_cast<__nv_bfloat16*>(ws.g1_all.ptr);
   auto* c_all_ptr = static_cast<__nv_bfloat16*>(ws.c_all.ptr);
   auto* o_all_ptr = static_cast<__nv_bfloat16*>(ws.o_all.ptr);
-  auto* output_accum_ptr = static_cast<float*>(ws.output_accum.ptr);
 
-  std::array<std::vector<int32_t>, kNumPipelineStreams> stream_experts;
-  stream_experts[0] = active_experts;
-  const auto runs = build_expert_runs(stream_experts[0], host_counts);
-
-  auto& pipeline = ws.pipelines[0];
-  pipeline.set_stream();
-
-  for (const ExpertRun& run : runs) {
-    if (run.batch_size == 1) {
-      const int32_t expert = run.first_expert;
-      const int32_t start = host_offsets[expert];
-      const int32_t count = host_counts[expert];
-      const int32_t padded_count = run.padded_count;
-
-      pipeline.a_fp8_buf.ensure(static_cast<size_t>(padded_count) * kHiddenSize * sizeof(__nv_fp8_e4m3));
-      pipeline.a_scale_buf.ensure(static_cast<size_t>(kNumHiddenBlocks) * padded_count * sizeof(float));
-      pipeline.g1_tmp_buf.ensure(static_cast<size_t>(padded_count) * kGemm1OutSize * sizeof(__nv_bfloat16));
-
-      auto* a_fp8_ptr = static_cast<__nv_fp8_e4m3*>(pipeline.a_fp8_buf.ptr);
-      auto* a_scale_ptr = static_cast<float*>(pipeline.a_scale_buf.ptr);
-      auto* g1_tmp_ptr = static_cast<__nv_bfloat16*>(pipeline.g1_tmp_buf.ptr);
-
-      CUDA_CHECK(cudaMemsetAsync(
-          a_fp8_ptr, 0, static_cast<size_t>(padded_count) * kHiddenSize * sizeof(__nv_fp8_e4m3),
-          pipeline.stream));
-      CUDA_CHECK(cudaMemsetAsync(
-          a_scale_ptr, 0, static_cast<size_t>(kNumHiddenBlocks) * padded_count * sizeof(float),
-          pipeline.stream));
-
-      dim3 gather_fp8_grid((kHiddenSize + act_block.x - 1) / act_block.x, count);
-      gather_hidden_fp8_kernel<<<gather_fp8_grid, act_block, 0, pipeline.stream>>>(
-          hidden_states_ptr, token_ids_ptr + start, a_fp8_ptr, count);
-      CUDA_CHECK(cudaGetLastError());
-
-      dim3 gather_scale_grid((count + 255) / 256, kNumHiddenBlocks);
-      gather_hidden_scale_kernel<<<gather_scale_grid, 256, 0, pipeline.stream>>>(
-          hidden_states_scale_ptr, token_ids_ptr + start, a_scale_ptr, count, seq_len, padded_count);
-      CUDA_CHECK(cudaGetLastError());
-
-      const auto* w13_expert_ptr =
-          gemm1_weights_ptr + static_cast<int64_t>(expert) * kGemm1OutSize * kHiddenSize;
-      const auto* w13_scale_expert_ptr =
-          gemm1_weights_scale_ptr + static_cast<int64_t>(expert) * kNumGemm1OutBlocks * kNumHiddenBlocks;
-      auto* g1_dst_ptr = padded_count == count ? (g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize)
-                                               : g1_tmp_ptr;
-
-      const bool fp8_ok = gemm_fp8_blockscale_rowmajor(
-          pipeline.cublaslt, pipeline.stream, pipeline.lt_workspace.ptr, pipeline.lt_workspace.bytes,
-          padded_count, kGemm1OutSize, kHiddenSize, a_fp8_ptr, a_scale_ptr, w13_expert_ptr,
-          w13_scale_expert_ptr, g1_dst_ptr);
-
-      if (fp8_ok) {
-        if (padded_count != count) {
-          CUDA_CHECK(cudaMemcpyAsync(
-              g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize, g1_tmp_ptr,
-              static_cast<size_t>(count) * kGemm1OutSize * sizeof(__nv_bfloat16),
-              cudaMemcpyDeviceToDevice, pipeline.stream));
-        }
-      } else {
-        pipeline.a_bf16_buf.ensure(static_cast<size_t>(count) * kHiddenSize * sizeof(__nv_bfloat16));
-        pipeline.w13_buf.ensure(static_cast<size_t>(kGemm1OutSize) * kHiddenSize * sizeof(__nv_bfloat16));
-        auto* a_bf16_ptr = static_cast<__nv_bfloat16*>(pipeline.a_bf16_buf.ptr);
-        auto* w13_bf16_ptr = static_cast<__nv_bfloat16*>(pipeline.w13_buf.ptr);
-
-        dim3 this_act_grid((kHiddenSize + act_block.x - 1) / act_block.x, count);
-        dequant_hidden_kernel_strided<<<this_act_grid, act_block, 0, pipeline.stream>>>(
-            hidden_states_ptr, hidden_states_scale_ptr, token_ids_ptr + start, a_bf16_ptr, count, seq_len);
-        CUDA_CHECK(cudaGetLastError());
-
-        dequant_gemm1_weight_kernel<<<g1_weight_grid, g1_weight_block, 0, pipeline.stream>>>(
-            gemm1_weights_ptr, gemm1_weights_scale_ptr, w13_bf16_ptr, expert);
-        CUDA_CHECK(cudaGetLastError());
-
-        gemm_bf16_rowmajor(
-            pipeline.cublas, count, kGemm1OutSize, kHiddenSize, a_bf16_ptr, w13_bf16_ptr,
-            g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize);
-      }
+  for (int s = 0; s < kNumPipelineStreams; ++s) {
+    if (stream_experts[s].empty()) {
       continue;
     }
 
-    const int32_t padded_count = run.padded_count;
-    const int32_t batch_size = run.batch_size;
-    const int32_t first_expert = run.first_expert;
-
-    pipeline.a_fp8_buf.ensure(
-        static_cast<size_t>(batch_size) * padded_count * kHiddenSize * sizeof(__nv_fp8_e4m3));
-    pipeline.a_scale_buf.ensure(
-        static_cast<size_t>(batch_size) * kNumHiddenBlocks * padded_count * sizeof(float));
-    pipeline.g1_tmp_buf.ensure(
-        static_cast<size_t>(batch_size) * padded_count * kGemm1OutSize * sizeof(__nv_bfloat16));
-
-    auto* a_fp8_ptr = static_cast<__nv_fp8_e4m3*>(pipeline.a_fp8_buf.ptr);
-    auto* a_scale_ptr = static_cast<float*>(pipeline.a_scale_buf.ptr);
-    auto* g1_tmp_ptr = static_cast<__nv_bfloat16*>(pipeline.g1_tmp_buf.ptr);
-
-    CUDA_CHECK(cudaMemsetAsync(
-        a_fp8_ptr,
-        0,
-        static_cast<size_t>(batch_size) * padded_count * kHiddenSize * sizeof(__nv_fp8_e4m3),
+    auto& pipeline = ws.pipelines[s];
+    pipeline.set_stream();
+    CUDA_CHECK(cudaStreamWaitEvent(pipeline.stream, ws.route_ready_event, 0));
+    const auto runs = build_expert_runs(stream_experts[s], host_counts);
+    std::vector<int32_t> stream_ids = stream_experts[s];
+    std::vector<int32_t> stream_starts(stream_experts[s].size());
+    std::vector<int32_t> stream_counts(stream_experts[s].size());
+    int32_t stream_max_count = 0;
+    for (size_t idx = 0; idx < stream_experts[s].size(); ++idx) {
+      const int32_t expert = stream_experts[s][idx];
+      stream_starts[idx] = host_offsets[expert];
+      stream_counts[idx] = host_counts[expert];
+      stream_max_count = std::max(stream_max_count, host_counts[expert]);
+    }
+    pipeline.expert_ids_buf.ensure(stream_ids.size() * sizeof(int32_t));
+    pipeline.expert_starts_buf.ensure(stream_starts.size() * sizeof(int32_t));
+    pipeline.expert_counts_buf.ensure(stream_counts.size() * sizeof(int32_t));
+    CUDA_CHECK(cudaMemcpyAsync(
+        pipeline.expert_ids_buf.ptr,
+        stream_ids.data(),
+        stream_ids.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice,
         pipeline.stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        a_scale_ptr,
-        0,
-        static_cast<size_t>(batch_size) * kNumHiddenBlocks * padded_count * sizeof(float),
+    CUDA_CHECK(cudaMemcpyAsync(
+        pipeline.expert_starts_buf.ptr,
+        stream_starts.data(),
+        stream_starts.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice,
+        pipeline.stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        pipeline.expert_counts_buf.ptr,
+        stream_counts.data(),
+        stream_counts.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice,
         pipeline.stream));
 
-    for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-      const int32_t expert = first_expert + batch_idx;
-      const int32_t start = host_offsets[expert];
-      const int32_t count = host_counts[expert];
+    pipeline.w13_buf.ensure(
+        static_cast<size_t>(stream_experts[s].size()) * kGemm1OutSize * kHiddenSize * sizeof(__nv_bfloat16));
+    auto* w13_all_ptr = static_cast<__nv_bfloat16*>(pipeline.w13_buf.ptr);
+    dim3 packed_hidden_grid(
+        (kHiddenSize + act_block.x - 1) / act_block.x,
+        stream_max_count,
+        static_cast<unsigned>(stream_experts[s].size()));
+    dequant_hidden_packed_kernel<<<packed_hidden_grid, act_block, 0, pipeline.stream>>>(
+        hidden_states_ptr,
+        hidden_states_scale_ptr,
+        token_ids_ptr,
+        static_cast<const int32_t*>(pipeline.expert_starts_buf.ptr),
+        static_cast<const int32_t*>(pipeline.expert_counts_buf.ptr),
+        a_all_ptr,
+        seq_len);
+    CUDA_CHECK(cudaGetLastError());
 
-      dim3 gather_fp8_grid((kHiddenSize + act_block.x - 1) / act_block.x, count);
-      gather_hidden_fp8_kernel<<<gather_fp8_grid, act_block, 0, pipeline.stream>>>(
-          hidden_states_ptr,
-          token_ids_ptr + start,
-          a_fp8_ptr + static_cast<int64_t>(batch_idx) * padded_count * kHiddenSize,
-          count);
-      CUDA_CHECK(cudaGetLastError());
+    dim3 w13_grid(
+        (kHiddenSize + g1_weight_block.x - 1) / g1_weight_block.x,
+        (kGemm1OutSize + g1_weight_block.y - 1) / g1_weight_block.y,
+        static_cast<unsigned>(stream_experts[s].size()));
+    dequant_gemm1_weight_batched_kernel<<<w13_grid, g1_weight_block, 0, pipeline.stream>>>(
+        gemm1_weights_ptr,
+        gemm1_weights_scale_ptr,
+        static_cast<const int32_t*>(pipeline.expert_ids_buf.ptr),
+        w13_all_ptr);
+    CUDA_CHECK(cudaGetLastError());
 
-      dim3 gather_scale_grid((count + 255) / 256, kNumHiddenBlocks);
-      gather_hidden_scale_kernel<<<gather_scale_grid, 256, 0, pipeline.stream>>>(
-          hidden_states_scale_ptr,
-          token_ids_ptr + start,
-          a_scale_ptr + static_cast<int64_t>(batch_idx) * kNumHiddenBlocks * padded_count,
-          count,
-          seq_len,
-          padded_count);
-      CUDA_CHECK(cudaGetLastError());
+    size_t run_offset = 0;
+    for (const ExpertRun& run : runs) {
+      const int32_t first_start = host_offsets[stream_experts[s][run_offset]];
+      gemm_bf16_rowmajor_strided_batched(
+          pipeline.cublas,
+          run.token_count,
+          kGemm1OutSize,
+          kHiddenSize,
+          a_all_ptr + static_cast<int64_t>(first_start) * kHiddenSize,
+          w13_all_ptr + static_cast<int64_t>(run_offset) * kGemm1OutSize * kHiddenSize,
+          g1_all_ptr + static_cast<int64_t>(first_start) * kGemm1OutSize,
+          run.batch_size);
+      run_offset += static_cast<size_t>(run.batch_size);
     }
 
-    const auto* w13_expert_ptr =
-        gemm1_weights_ptr + static_cast<int64_t>(first_expert) * kGemm1OutSize * kHiddenSize;
-    const auto* w13_scale_expert_ptr =
-        gemm1_weights_scale_ptr +
-        static_cast<int64_t>(first_expert) * kNumGemm1OutBlocks * kNumHiddenBlocks;
+    CUDA_CHECK(cudaEventRecord(pipeline.done_event, pipeline.stream));
+  }
 
-    const bool fp8_ok = gemm_fp8_blockscale_rowmajor_batched(
-        pipeline.cublaslt,
-        pipeline.stream,
-        pipeline.lt_workspace.ptr,
-        pipeline.lt_workspace.bytes,
-        batch_size,
-        padded_count,
-        kGemm1OutSize,
-        kHiddenSize,
-        a_fp8_ptr,
-        a_scale_ptr,
-        w13_expert_ptr,
-        w13_scale_expert_ptr,
-        g1_tmp_ptr);
-
-    if (fp8_ok) {
-      for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        const int32_t expert = first_expert + batch_idx;
-        const int32_t start = host_offsets[expert];
-        const int32_t count = host_counts[expert];
-        CUDA_CHECK(cudaMemcpyAsync(
-            g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize,
-            g1_tmp_ptr + static_cast<int64_t>(batch_idx) * padded_count * kGemm1OutSize,
-            static_cast<size_t>(count) * kGemm1OutSize * sizeof(__nv_bfloat16),
-            cudaMemcpyDeviceToDevice,
-            pipeline.stream));
-      }
-    } else {
-      for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        const int32_t expert = first_expert + batch_idx;
-        const int32_t start = host_offsets[expert];
-        const int32_t count = host_counts[expert];
-        pipeline.a_bf16_buf.ensure(static_cast<size_t>(count) * kHiddenSize * sizeof(__nv_bfloat16));
-        pipeline.w13_buf.ensure(static_cast<size_t>(kGemm1OutSize) * kHiddenSize * sizeof(__nv_bfloat16));
-        auto* a_bf16_ptr = static_cast<__nv_bfloat16*>(pipeline.a_bf16_buf.ptr);
-        auto* w13_bf16_ptr = static_cast<__nv_bfloat16*>(pipeline.w13_buf.ptr);
-
-        dim3 this_act_grid((kHiddenSize + act_block.x - 1) / act_block.x, count);
-        dequant_hidden_kernel_strided<<<this_act_grid, act_block, 0, pipeline.stream>>>(
-            hidden_states_ptr, hidden_states_scale_ptr, token_ids_ptr + start, a_bf16_ptr, count, seq_len);
-        CUDA_CHECK(cudaGetLastError());
-
-        dequant_gemm1_weight_kernel<<<g1_weight_grid, g1_weight_block, 0, pipeline.stream>>>(
-            gemm1_weights_ptr, gemm1_weights_scale_ptr, w13_bf16_ptr, expert);
-        CUDA_CHECK(cudaGetLastError());
-
-        gemm_bf16_rowmajor(
-            pipeline.cublas, count, kGemm1OutSize, kHiddenSize, a_bf16_ptr, w13_bf16_ptr,
-            g1_all_ptr + static_cast<int64_t>(start) * kGemm1OutSize);
-      }
+  for (int s = 0; s < kNumPipelineStreams; ++s) {
+    if (!stream_experts[s].empty()) {
+      CUDA_CHECK(cudaStreamWaitEvent(stream, ws.pipelines[s].done_event, 0));
     }
   }
 
-  CUDA_CHECK(cudaEventRecord(pipeline.done_event, pipeline.stream));
-  CUDA_CHECK(cudaStreamWaitEvent(stream, pipeline.done_event, 0));
-
-  dim3 all_pairs_act_grid((kHiddenSize + act_block.x - 1) / act_block.x, total_pairs);
   dim3 all_pairs_swiglu_grid((kIntermediateSize + swiglu_block.x - 1) / swiglu_block.x, total_pairs);
   swiglu_kernel<<<all_pairs_swiglu_grid, swiglu_block, 0, stream>>>(g1_all_ptr, c_all_ptr, total_pairs);
   CUDA_CHECK(cudaGetLastError());
 
   CUDA_CHECK(cudaEventRecord(ws.route_ready_event, stream));
-  pipeline.set_stream();
-  CUDA_CHECK(cudaStreamWaitEvent(pipeline.stream, ws.route_ready_event, 0));
 
-  for (const ExpertRun& run : runs) {
-    if (run.batch_size == 1) {
-      const int32_t expert = run.first_expert;
-      const int32_t start = host_offsets[expert];
-      const int32_t count = host_counts[expert];
-      const int32_t padded_count = run.padded_count;
-
-      pipeline.c_fp8_buf.ensure(
-          static_cast<size_t>(padded_count) * kIntermediateSize * sizeof(__nv_fp8_e4m3));
-      pipeline.c_scale_buf.ensure(
-          static_cast<size_t>(kNumIntermediateBlocks) * padded_count * sizeof(float));
-      pipeline.o_tmp_buf.ensure(
-          static_cast<size_t>(padded_count) * kHiddenSize * sizeof(__nv_bfloat16));
-
-      auto* c_fp8_ptr = static_cast<__nv_fp8_e4m3*>(pipeline.c_fp8_buf.ptr);
-      auto* c_scale_ptr = static_cast<float*>(pipeline.c_scale_buf.ptr);
-      auto* o_tmp_ptr = static_cast<__nv_bfloat16*>(pipeline.o_tmp_buf.ptr);
-
-      CUDA_CHECK(cudaMemsetAsync(
-          c_fp8_ptr, 0, static_cast<size_t>(padded_count) * kIntermediateSize * sizeof(__nv_fp8_e4m3),
-          pipeline.stream));
-      CUDA_CHECK(cudaMemsetAsync(
-          c_scale_ptr, 0, static_cast<size_t>(kNumIntermediateBlocks) * padded_count * sizeof(float),
-          pipeline.stream));
-
-      dim3 quant_grid(kNumIntermediateBlocks, count);
-      quantize_bf16_to_fp8_block128_kernel<<<quant_grid, kBlock, 0, pipeline.stream>>>(
-          c_all_ptr + static_cast<int64_t>(start) * kIntermediateSize,
-          c_fp8_ptr,
-          c_scale_ptr,
-          count,
-          padded_count,
-          kIntermediateSize);
-      CUDA_CHECK(cudaGetLastError());
-
-      const auto* w2_expert_ptr =
-          gemm2_weights_ptr + static_cast<int64_t>(expert) * kHiddenSize * kIntermediateSize;
-      const auto* w2_scale_expert_ptr =
-          gemm2_weights_scale_ptr + static_cast<int64_t>(expert) * kNumHiddenBlocks * kNumIntermediateBlocks;
-      auto* o_dst_ptr = padded_count == count ? (o_all_ptr + static_cast<int64_t>(start) * kHiddenSize)
-                                              : o_tmp_ptr;
-
-      const bool fp8_ok = gemm_fp8_blockscale_rowmajor(
-          pipeline.cublaslt, pipeline.stream, pipeline.lt_workspace.ptr, pipeline.lt_workspace.bytes,
-          padded_count, kHiddenSize, kIntermediateSize, c_fp8_ptr, c_scale_ptr, w2_expert_ptr,
-          w2_scale_expert_ptr, o_dst_ptr);
-
-      if (fp8_ok) {
-        if (padded_count != count) {
-          CUDA_CHECK(cudaMemcpyAsync(
-              o_all_ptr + static_cast<int64_t>(start) * kHiddenSize, o_tmp_ptr,
-              static_cast<size_t>(count) * kHiddenSize * sizeof(__nv_bfloat16),
-              cudaMemcpyDeviceToDevice, pipeline.stream));
-        }
-      } else {
-        pipeline.w2_buf.ensure(static_cast<size_t>(kHiddenSize) * kIntermediateSize * sizeof(__nv_bfloat16));
-        auto* w2_bf16_ptr = static_cast<__nv_bfloat16*>(pipeline.w2_buf.ptr);
-        dequant_gemm2_weight_kernel<<<g2_weight_grid, g2_weight_block, 0, pipeline.stream>>>(
-            gemm2_weights_ptr, gemm2_weights_scale_ptr, w2_bf16_ptr, expert);
-        CUDA_CHECK(cudaGetLastError());
-
-        gemm_bf16_rowmajor(
-            pipeline.cublas, count, kHiddenSize, kIntermediateSize,
-            c_all_ptr + static_cast<int64_t>(start) * kIntermediateSize, w2_bf16_ptr,
-            o_all_ptr + static_cast<int64_t>(start) * kHiddenSize);
-      }
+  for (int s = 0; s < kNumPipelineStreams; ++s) {
+    if (stream_experts[s].empty()) {
       continue;
     }
 
-    const int32_t padded_count = run.padded_count;
-    const int32_t batch_size = run.batch_size;
-    const int32_t first_expert = run.first_expert;
-
-    pipeline.c_fp8_buf.ensure(
-        static_cast<size_t>(batch_size) * padded_count * kIntermediateSize * sizeof(__nv_fp8_e4m3));
-    pipeline.c_scale_buf.ensure(
-        static_cast<size_t>(batch_size) * kNumIntermediateBlocks * padded_count * sizeof(float));
-    pipeline.o_tmp_buf.ensure(
-        static_cast<size_t>(batch_size) * padded_count * kHiddenSize * sizeof(__nv_bfloat16));
-
-    auto* c_fp8_ptr = static_cast<__nv_fp8_e4m3*>(pipeline.c_fp8_buf.ptr);
-    auto* c_scale_ptr = static_cast<float*>(pipeline.c_scale_buf.ptr);
-    auto* o_tmp_ptr = static_cast<__nv_bfloat16*>(pipeline.o_tmp_buf.ptr);
-
-    CUDA_CHECK(cudaMemsetAsync(
-        c_fp8_ptr,
-        0,
-        static_cast<size_t>(batch_size) * padded_count * kIntermediateSize * sizeof(__nv_fp8_e4m3),
+    auto& pipeline = ws.pipelines[s];
+    pipeline.set_stream();
+    CUDA_CHECK(cudaStreamWaitEvent(pipeline.stream, ws.route_ready_event, 0));
+    const auto runs = build_expert_runs(stream_experts[s], host_counts);
+    std::vector<int32_t> stream_ids = stream_experts[s];
+    pipeline.expert_ids_buf.ensure(stream_ids.size() * sizeof(int32_t));
+    CUDA_CHECK(cudaMemcpyAsync(
+        pipeline.expert_ids_buf.ptr,
+        stream_ids.data(),
+        stream_ids.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice,
         pipeline.stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        c_scale_ptr,
-        0,
-        static_cast<size_t>(batch_size) * kNumIntermediateBlocks * padded_count * sizeof(float),
-        pipeline.stream));
+    pipeline.w2_buf.ensure(
+        static_cast<size_t>(stream_experts[s].size()) * kHiddenSize * kIntermediateSize * sizeof(__nv_bfloat16));
+    auto* w2_all_ptr = static_cast<__nv_bfloat16*>(pipeline.w2_buf.ptr);
+    dim3 w2_grid(
+        (kIntermediateSize + g2_weight_block.x - 1) / g2_weight_block.x,
+        (kHiddenSize + g2_weight_block.y - 1) / g2_weight_block.y,
+        static_cast<unsigned>(stream_experts[s].size()));
+    dequant_gemm2_weight_batched_kernel<<<w2_grid, g2_weight_block, 0, pipeline.stream>>>(
+        gemm2_weights_ptr,
+        gemm2_weights_scale_ptr,
+        static_cast<const int32_t*>(pipeline.expert_ids_buf.ptr),
+        w2_all_ptr);
+    CUDA_CHECK(cudaGetLastError());
 
-    for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-      const int32_t expert = first_expert + batch_idx;
-      const int32_t start = host_offsets[expert];
-      const int32_t count = host_counts[expert];
-      dim3 quant_grid(kNumIntermediateBlocks, count);
-      quantize_bf16_to_fp8_block128_kernel<<<quant_grid, kBlock, 0, pipeline.stream>>>(
-          c_all_ptr + static_cast<int64_t>(start) * kIntermediateSize,
-          c_fp8_ptr + static_cast<int64_t>(batch_idx) * padded_count * kIntermediateSize,
-          c_scale_ptr + static_cast<int64_t>(batch_idx) * kNumIntermediateBlocks * padded_count,
-          count,
-          padded_count,
-          kIntermediateSize);
-      CUDA_CHECK(cudaGetLastError());
+    size_t run2_offset = 0;
+    for (const ExpertRun& run : runs) {
+      const int32_t first_start = host_offsets[stream_experts[s][run2_offset]];
+      gemm_bf16_rowmajor_strided_batched(
+          pipeline.cublas,
+          run.token_count,
+          kHiddenSize,
+          kIntermediateSize,
+          c_all_ptr + static_cast<int64_t>(first_start) * kIntermediateSize,
+          w2_all_ptr + static_cast<int64_t>(run2_offset) * kHiddenSize * kIntermediateSize,
+          o_all_ptr + static_cast<int64_t>(first_start) * kHiddenSize,
+          run.batch_size);
+      run2_offset += static_cast<size_t>(run.batch_size);
     }
 
-    const auto* w2_expert_ptr =
-        gemm2_weights_ptr + static_cast<int64_t>(first_expert) * kHiddenSize * kIntermediateSize;
-    const auto* w2_scale_expert_ptr =
-        gemm2_weights_scale_ptr +
-        static_cast<int64_t>(first_expert) * kNumHiddenBlocks * kNumIntermediateBlocks;
+    CUDA_CHECK(cudaEventRecord(pipeline.done_event, pipeline.stream));
+  }
 
-    const bool fp8_ok = gemm_fp8_blockscale_rowmajor_batched(
-        pipeline.cublaslt,
-        pipeline.stream,
-        pipeline.lt_workspace.ptr,
-        pipeline.lt_workspace.bytes,
-        batch_size,
-        padded_count,
-        kHiddenSize,
-        kIntermediateSize,
-        c_fp8_ptr,
-        c_scale_ptr,
-        w2_expert_ptr,
-        w2_scale_expert_ptr,
-        o_tmp_ptr);
-
-    if (fp8_ok) {
-      for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        const int32_t expert = first_expert + batch_idx;
-        const int32_t start = host_offsets[expert];
-        const int32_t count = host_counts[expert];
-        CUDA_CHECK(cudaMemcpyAsync(
-            o_all_ptr + static_cast<int64_t>(start) * kHiddenSize,
-            o_tmp_ptr + static_cast<int64_t>(batch_idx) * padded_count * kHiddenSize,
-            static_cast<size_t>(count) * kHiddenSize * sizeof(__nv_bfloat16),
-            cudaMemcpyDeviceToDevice,
-            pipeline.stream));
-      }
-    } else {
-      for (int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        const int32_t expert = first_expert + batch_idx;
-        const int32_t start = host_offsets[expert];
-        const int32_t count = host_counts[expert];
-        pipeline.w2_buf.ensure(static_cast<size_t>(kHiddenSize) * kIntermediateSize * sizeof(__nv_bfloat16));
-        auto* w2_bf16_ptr = static_cast<__nv_bfloat16*>(pipeline.w2_buf.ptr);
-        dequant_gemm2_weight_kernel<<<g2_weight_grid, g2_weight_block, 0, pipeline.stream>>>(
-            gemm2_weights_ptr, gemm2_weights_scale_ptr, w2_bf16_ptr, expert);
-        CUDA_CHECK(cudaGetLastError());
-
-        gemm_bf16_rowmajor(
-            pipeline.cublas, count, kHiddenSize, kIntermediateSize,
-            c_all_ptr + static_cast<int64_t>(start) * kIntermediateSize, w2_bf16_ptr,
-            o_all_ptr + static_cast<int64_t>(start) * kHiddenSize);
-      }
+  for (int s = 0; s < kNumPipelineStreams; ++s) {
+    if (!stream_experts[s].empty()) {
+      CUDA_CHECK(cudaStreamWaitEvent(stream, ws.pipelines[s].done_event, 0));
     }
   }
 
-  CUDA_CHECK(cudaEventRecord(pipeline.done_event, pipeline.stream));
-  CUDA_CHECK(cudaStreamWaitEvent(stream, pipeline.done_event, 0));
-
-  accumulate_kernel<<<all_pairs_act_grid, act_block, 0, stream>>>(
-      token_ids_ptr,
-      pair_weights_ptr,
-      o_all_ptr,
-      output_accum_ptr,
-      total_pairs);
-  CUDA_CHECK(cudaGetLastError());
-
-  const int total = seq_len * kHiddenSize;
-  const int cast_blocks = (total + 255) / 256;
-  cast_output_kernel<<<cast_blocks, 256, 0, stream>>>(output_accum_ptr, output_ptr, total);
+  dim3 finalize_grid((kHiddenSize + act_block.x - 1) / act_block.x, seq_len);
+  finalize_output_kernel<<<finalize_grid, act_block, 0, stream>>>(
+      local_weights_ptr, pair_rows_ptr, o_all_ptr, output_ptr, seq_len);
   CUDA_CHECK(cudaGetLastError());
 }
