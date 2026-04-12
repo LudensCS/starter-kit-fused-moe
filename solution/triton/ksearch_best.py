@@ -17,6 +17,18 @@ NUM_INTERMEDIATE_BLOCKS = INTERMEDIATE_SIZE // BLOCK_SIZE
 EXPERTS_PER_GROUP = NUM_EXPERTS_GLOBAL // N_GROUP
 EPS = 1e-20
 
+GEMM1_BLOCK_M = 32
+GEMM1_BLOCK_N = 128
+GEMM1_BLOCK_K = 64
+GEMM1_NUM_WARPS = 4
+GEMM1_NUM_STAGES = 3
+
+GEMM2_BLOCK_M = 32
+GEMM2_BLOCK_N = 128
+GEMM2_BLOCK_K = 64
+GEMM2_NUM_WARPS = 4
+GEMM2_NUM_STAGES = 3
+
 
 @triton.jit
 def _routing_topk_kernel(
@@ -40,8 +52,8 @@ def _routing_topk_kernel(
     pid = tl.program_id(0)
     expert_offs = tl.arange(0, 256)
     group_offs = tl.arange(0, 8)
-    expert_tiebreak = expert_offs.to(tl.float32) * 1e-6
-    group_tiebreak = group_offs.to(tl.float32) * 1e-4
+    expert_tiebreak = expert_offs.to(tl.float32) * -1e-6
+    group_tiebreak = group_offs.to(tl.float32) * -1e-4
 
     logits = tl.load(logits_ptr + pid * stride_lm + expert_offs * stride_ln).to(tl.float32)
     bias = tl.load(bias_ptr + expert_offs).to(tl.float32)
@@ -82,12 +94,11 @@ def _routing_topk_kernel(
         total_sig += expert_sig
         candidate_scores = tl.where(chosen_expert, -1.0e30, candidate_scores)
 
-    inv_total = 1.0 / (total_sig + 1.0e-20)
     for k in range(8):
         weight = tl.load(topk_weights_ptr + pid * stride_twm + k * stride_twn).to(tl.float32)
         tl.store(
             topk_weights_ptr + pid * stride_twm + k * stride_twn,
-            weight * inv_total * routed_scaling_factor,
+            tl.where(total_sig > 1.0e-20, weight / total_sig, 1.0) * routed_scaling_factor,
         )
 
     for base in range(0, 7168, 256):
@@ -186,6 +197,7 @@ def _gemm1_swiglu_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    K_TILES: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -199,23 +211,29 @@ def _gemm1_swiglu_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     slot_ids = start + offs_m
     mask_m = offs_m < count
-    token_ids = tl.load(token_ptr + slot_ids * stride_t, mask=mask_m, other=0).to(tl.int32)
-
+    token_ids = tl.load(
+        token_ptr + slot_ids * stride_t,
+        mask=mask_m,
+        other=0,
+    ).to(tl.int32)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_n < 2048
+    gate_scale_n = (pid_n * BLOCK_N) // 128
+    up_scale_n = gate_scale_n + 16
 
     acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for kb in range(56):
+    for kb in range(K_TILES):
         offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        scale_k = (kb * BLOCK_K) // 128
         hidden = tl.load(
             hidden_ptr + token_ids[:, None] * stride_hm + offs_k[None, :] * stride_hk,
             mask=mask_m[:, None],
             other=0.0,
         ).to(tl.float32)
         hidden_scale = tl.load(
-            hidden_scale_ptr + kb * stride_hsm + token_ids * stride_hsn,
+            hidden_scale_ptr + scale_k * stride_hsm + token_ids * stride_hsn,
             mask=mask_m,
             other=0.0,
         ).to(tl.float32)
@@ -239,13 +257,16 @@ def _gemm1_swiglu_kernel(
         ).to(tl.float32)
 
         gate_scale = tl.load(
-            weight_scale_ptr + pid_e * stride_wse + pid_n * stride_wsn + kb * stride_wsk
+            weight_scale_ptr
+            + pid_e * stride_wse
+            + gate_scale_n * stride_wsn
+            + scale_k * stride_wsk
         ).to(tl.float32)
         up_scale = tl.load(
             weight_scale_ptr
             + pid_e * stride_wse
-            + (pid_n + 16) * stride_wsn
-            + kb * stride_wsk
+            + up_scale_n * stride_wsn
+            + scale_k * stride_wsk
         ).to(tl.float32)
 
         gate = (gate * gate_scale).to(tl.bfloat16)
@@ -289,6 +310,7 @@ def _gemm2_scatter_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    K_TILES: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -309,13 +331,14 @@ def _gemm2_scatter_kernel(
         mask=mask_m,
         other=0.0,
     ).to(tl.float32)
-
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_n < 7168
+    scale_n = (pid_n * BLOCK_N) // 128
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for kb in range(16):
+    for kb in range(K_TILES):
         offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        scale_k = (kb * BLOCK_K) // 128
         act = tl.load(
             act_ptr + slot_ids[:, None] * stride_am + offs_k[None, :] * stride_ak,
             mask=mask_m[:, None],
@@ -330,7 +353,10 @@ def _gemm2_scatter_kernel(
             other=0.0,
         ).to(tl.float32)
         weight_scale = tl.load(
-            weight_scale_ptr + pid_e * stride_wse + pid_n * stride_wsn + kb * stride_wsk
+            weight_scale_ptr
+            + pid_e * stride_wse
+            + scale_n * stride_wsn
+            + scale_k * stride_wsk
         ).to(tl.float32)
         weight = (weight * weight_scale).to(tl.bfloat16)
         acc += tl.dot(act, weight)
@@ -451,8 +477,8 @@ def _gemm1_swiglu_triton(
         return out
 
     grid = (
-        triton.cdiv(INTERMEDIATE_SIZE, BLOCK_SIZE),
-        triton.cdiv(max_count, 32),
+        triton.cdiv(INTERMEDIATE_SIZE, GEMM1_BLOCK_N),
+        triton.cdiv(max_count, GEMM1_BLOCK_M),
         NUM_LOCAL_EXPERTS,
     )
     cast(Any, _gemm1_swiglu_kernel)[grid](
@@ -479,11 +505,12 @@ def _gemm1_swiglu_triton(
         gemm1_weights_scale.stride(2),
         out.stride(0),
         out.stride(1),
-        BLOCK_M=32,
-        BLOCK_N=BLOCK_SIZE,
-        BLOCK_K=BLOCK_SIZE,
-        num_warps=8,
-        num_stages=2,
+        BLOCK_M=GEMM1_BLOCK_M,
+        BLOCK_N=GEMM1_BLOCK_N,
+        BLOCK_K=GEMM1_BLOCK_K,
+        K_TILES=HIDDEN_SIZE // GEMM1_BLOCK_K,
+        num_warps=GEMM1_NUM_WARPS,
+        num_stages=GEMM1_NUM_STAGES,
     )
     return out
 
@@ -503,8 +530,8 @@ def _gemm2_scatter_triton(
         return
 
     grid = (
-        triton.cdiv(HIDDEN_SIZE, BLOCK_SIZE),
-        triton.cdiv(max_count, 32),
+        triton.cdiv(HIDDEN_SIZE, GEMM2_BLOCK_N),
+        triton.cdiv(max_count, GEMM2_BLOCK_M),
         NUM_LOCAL_EXPERTS,
     )
     cast(Any, _gemm2_scatter_kernel)[grid](
@@ -530,11 +557,12 @@ def _gemm2_scatter_triton(
         gemm2_weights_scale.stride(2),
         output.stride(0),
         output.stride(1),
-        BLOCK_M=32,
-        BLOCK_N=BLOCK_SIZE,
-        BLOCK_K=BLOCK_SIZE,
-        num_warps=8,
-        num_stages=2,
+        BLOCK_M=GEMM2_BLOCK_M,
+        BLOCK_N=GEMM2_BLOCK_N,
+        BLOCK_K=GEMM2_BLOCK_K,
+        K_TILES=INTERMEDIATE_SIZE // GEMM2_BLOCK_K,
+        num_warps=GEMM2_NUM_WARPS,
+        num_stages=GEMM2_NUM_STAGES,
     )
 
 
