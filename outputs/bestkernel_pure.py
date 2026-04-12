@@ -1,3 +1,5 @@
+from typing import Any, cast
+
 import torch
 import triton
 import triton.language as tl
@@ -98,7 +100,7 @@ def _swiglu_triton(g1: torch.Tensor) -> torch.Tensor:
     if rows == 0:
         return out
     grid = (rows, triton.cdiv(INTERMEDIATE_SIZE, BLOCK_SIZE))
-    _swiglu_kernel[grid](
+    cast(Any, _swiglu_kernel)[grid](
         g1,
         out,
         rows,
