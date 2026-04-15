@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from flashinfer_bench import Solution, TraceSet
-from flashinfer_bench.agents import flashinfer_bench_run_ncu
+from flashinfer_bench.agents import flashinfer_bench_run_ncu,flashinfer_bench_list_ncu_options
 from scripts.pack_solution import pack_solution
 
 
@@ -98,12 +98,20 @@ def main():
         trace_set_path=trace_set_path,
         #set="detailed",
         sections=[
-            "SpeedOfLight",             # 核心利用率 (Compute vs Memory SOL)
-            "MemoryWorkloadAnalysis",   # 访存层级分析 (HBM/L2/Shared Memory/TMA)
-            "ComputeWorkloadAnalysis",  # 算力流水线分析 (Tensor Core 利用率)
-            "SchedulerStats",           # 调度统计 (寻找 Warp Stall 的真凶)
-            "InstructionStats",         # 指令分布 (确认是否走 FP8 Tensor Core 路径)
-            "WarpStateStats",           # Warp 状态切换 (分析同步/依赖延迟)
+            # "SpeedOfLight",               # 基础利用率
+            # "SpeedOfLight_RooflineChart", # 核心：生成多级 Roofline 图表
+            # "MemoryWorkloadAnalysis",     # 访存分析
+            # "ComputeWorkloadAnalysis",    # 算力分析
+            # "SchedulerStats",             
+            # "InstructionStats",           
+            # "WarpStateStats",
+            "SpeedOfLight",                                # 基础吞吐
+            "SpeedOfLight_RooflineChart",                 # 通用 Roofline
+            "SpeedOfLight_HierarchicalTensorRooflineChart", # 核心：针对 MoE FP8 的 Tensor Core Roofline
+            "MemoryWorkloadAnalysis",                     # 访存层级分析
+            "ComputeWorkloadAnalysis",                    # 算力流水线分析
+            "SchedulerStats",                             # 调度统计
+            "WarpStateStats",                             # Warp 状态（分析延迟瓶颈）
         ],
         page="details",
         timeout=3600,
@@ -113,3 +121,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    #print(flashinfer_bench_list_ncu_options())
