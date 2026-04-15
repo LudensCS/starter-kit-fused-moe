@@ -218,3 +218,4 @@ __marimo__/
 
 #generated files
 outputs/*.txt
+outputs/*.ncu-rep
