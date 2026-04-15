@@ -217,4 +217,4 @@ marimo/_lsp/
 __marimo__/
 
 #generated files
-outputs/*.txt
+outputs/*.txtoutputs/moe_roofline_report.ncu-rep
