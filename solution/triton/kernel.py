@@ -578,9 +578,10 @@ def run(
     gemm2_weights_scale: torch.Tensor,
     local_expert_offset: int,
     routed_scaling_factor: float,
+    output: torch.Tensor | None = None,
 ):
-    output_device = hidden_states.device
-    return_to_origin = output_device.type != "cuda"
+    output_tensor = output
+    output_device = output_tensor.device if output_tensor is not None else hidden_states.device
 
     if (
         routing_logits.device.type != "cuda"
@@ -631,21 +632,47 @@ def run(
     )
 
     seq_len = routing_logits.shape[0]
-    if seq_len == 0:
-        out = torch.empty((0, HIDDEN_SIZE), dtype=torch.bfloat16, device=routing_logits.device)
-        return out if not return_to_origin else out.to(output_device)
 
-    output = torch.empty((seq_len, HIDDEN_SIZE), dtype=torch.bfloat16, device=routing_logits.device)
+    expected_output_shape = (seq_len, HIDDEN_SIZE)
+    if output_tensor is not None and tuple(output_tensor.shape) != expected_output_shape:
+        raise ValueError(
+            f"output shape mismatch: expected {expected_output_shape}, got {tuple(output_tensor.shape)}"
+        )
+
+    if (
+        output_tensor is not None
+        and output_tensor.device.type == "cuda"
+        and output_tensor.dtype == torch.bfloat16
+        and output_tensor.is_contiguous()
+    ):
+        output_buffer = output_tensor
+    else:
+        output_buffer = torch.empty(
+            expected_output_shape,
+            dtype=torch.bfloat16,
+            device=routing_logits.device,
+        )
+
+    def _finalize_output(result: torch.Tensor) -> torch.Tensor:
+        if output_tensor is None:
+            return result if output_device.type == "cuda" else result.to(output_device)
+        if result.data_ptr() != output_tensor.data_ptr():
+            output_tensor.copy_(result.to(device=output_tensor.device, dtype=output_tensor.dtype))
+        return output_tensor
+
+    if seq_len == 0:
+        return _finalize_output(output_buffer)
+
     token_sorted, weight_sorted, counts, expert_offsets = _routing_and_scatter(
         routing_logits.to(torch.float32),
         routing_bias,
-        output,
+        output_buffer,
         local_expert_offset,
         routed_scaling_factor,
     )
     max_count = int(counts.max().item())
     if max_count == 0:
-        return output if not return_to_origin else output.to(output_device)
+        return _finalize_output(output_buffer)
 
     inter = _gemm1_swiglu_triton(
         hidden_states,
@@ -665,8 +692,8 @@ def run(
         expert_offsets,
         gemm2_weights,
         gemm2_weights_scale,
-        output,
+        output_buffer,
         max_count,
     )
 
-    return output if not return_to_origin else output.to(output_device)
+    return _finalize_output(output_buffer)
