@@ -1,0 +1,189 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>
+endobj
+2 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold >>
+endobj
+3 0 obj
+<< /Length 6037 >>
+stream
+BT /F2 15.00 Tf 64.99 791.89 Td (Expert-Compacted Triton Kernels for FP8 Block-Scaled MoE Inference) Tj ET
+BT /F2 12.20 Tf 48.00 758.89 Td (Abstract) Tj ET
+BT /F1 10.60 Tf 48.00 739.89 Td (This submission to the MoE track presents a specialized Triton design for FP8 block-scaled DeepSeek-) Tj ET
+BT /F1 10.60 Tf 48.00 726.89 Td (style expert inference. The workload combines no-auxiliary-loss routing, block-quantized expert) Tj ET
+BT /F1 10.60 Tf 48.00 713.89 Td (matrices, a gate/up projection with SwiGLU activation, and a down projection followed by per-token) Tj ET
+BT /F1 10.60 Tf 48.00 700.89 Td (weighted accumulation. The central design principle is to avoid materializing dequantized tensors) Tj ET
+BT /F1 10.60 Tf 48.00 687.89 Td (and to evaluate only the 32 experts resident on the current expert-parallel rank. The resulting) Tj ET
+BT /F1 10.60 Tf 48.00 674.89 Td (execution pipeline consists of token-local top-k routing, expert-major compaction of local routed) Tj ET
+BT /F1 10.60 Tf 48.00 661.89 Td (slots, a fused W13 GEMM and SwiGLU stage, and a W2 GEMM that scatters weighted contributions) Tj ET
+BT /F1 10.60 Tf 48.00 648.89 Td (directly to the output tensor. For short sequences, a synchronization-free execution mode replaces) Tj ET
+BT /F1 10.60 Tf 48.00 635.89 Td (host-planned compact GEMM jobs with dense expert grids that return early for empty experts. Nsight) Tj ET
+BT /F1 10.60 Tf 48.00 622.89 Td (Compute profiling of an intermediate revision indicates that the first expert projection dominates) Tj ET
+BT /F1 10.60 Tf 48.00 609.89 Td (total latency, whereas the routing and scatter stages are primarily launch-limited; these) Tj ET
+BT /F1 10.60 Tf 48.00 596.89 Td (observations guided the final separation between compact and synchronization-free regimes.) Tj ET
+BT /F2 12.20 Tf 48.00 571.89 Td (1. Problem Setting) Tj ET
+BT /F1 10.60 Tf 48.00 552.89 Td (The MoE track targets the expert block used in DeepSeek-V3/R1-style inference. For a sequence length) Tj ET
+BT /F1 10.60 Tf 48.00 539.89 Td (T, the inputs include FP32 routing logits of shape [T, 256], FP8 E4M3 hidden states of shape [T,) Tj ET
+BT /F1 10.60 Tf 48.00 526.89 Td (7168], block scales for every 128 hidden elements, FP8 local expert weights for 32 experts, and) Tj ET
+BT /F1 10.60 Tf 48.00 513.89 Td (corresponding block-scale tensors. The first expert matrix has shape [32, 4096, 7168], where the) Tj ET
+BT /F1 10.60 Tf 48.00 500.89 Td (output dimension is the concatenation of gate and up projections. The second matrix has shape [32,) Tj ET
+BT /F1 10.60 Tf 48.00 487.89 Td (7168, 2048]. The output is BF16 with shape [T, 7168].) Tj ET
+BT /F1 10.60 Tf 48.00 470.89 Td (The routing rule matches the reference semantics. For each token, the score used for selection is) Tj ET
+BT /F1 10.60 Tf 48.00 457.89 Td (sigmoid\(logit\) + bias. The 256 experts are divided into eight groups of 32 experts; each group is) Tj ET
+BT /F1 10.60 Tf 48.00 444.89 Td (scored by the sum of its top two expert scores; the top four groups are retained; and the final top) Tj ET
+BT /F1 10.60 Tf 48.00 431.89 Td (eight experts are selected within the retained groups. The combination weights are not computed from) Tj ET
+BT /F1 10.60 Tf 48.00 418.89 Td (the biased scores. They are computed from the unbiased sigmoid values on the selected experts,) Tj ET
+BT /F1 10.60 Tf 48.00 405.89 Td (normalized by their sum, and multiplied by routed_scaling_factor. Only experts in) Tj ET
+BT /F1 10.60 Tf 48.00 392.89 Td ([local_expert_offset, local_expert_offset + 32\) are evaluated on this rank.) Tj ET
+BT /F1 10.60 Tf 48.00 375.89 Td (The essential performance challenge is routing-induced irregularity. The number of local routed) Tj ET
+BT /F1 10.60 Tf 48.00 362.89 Td (tokens varies by expert and by input length, yet the arithmetic work inside each expert is a large) Tj ET
+BT /F1 10.60 Tf 48.00 349.89 Td (matrix multiplication with FP8 block dequantization. An efficient design must preserve expert) Tj ET
+BT /F1 10.60 Tf 48.00 336.89 Td (sparsity while presenting the GEMM stages with regular memory access and contiguous row ranges.) Tj ET
+BT /F2 12.20 Tf 48.00 311.89 Td (2. Solution Overview) Tj ET
+BT /F1 10.60 Tf 48.00 292.89 Td (The design is organized around an expert-compacted representation. The routing stage produces token-) Tj ET
+BT /F1 10.60 Tf 48.00 279.89 Td (major top-k expert identifiers and routing weights, while also counting how many selected experts) Tj ET
+BT /F1 10.60 Tf 48.00 266.89 Td (are local to the current rank. A prefix-sum and scatter phase converts this token-major routing) Tj ET
+BT /F1 10.60 Tf 48.00 253.89 Td (result into an expert-major queue. Each queue entry stores the original token identifier and the) Tj ET
+BT /F1 10.60 Tf 48.00 240.89 Td (associated routing weight. The GEMM stages therefore process contiguous row ranges for each local) Tj ET
+BT /F1 10.60 Tf 48.00 227.89 Td (expert rather than branching over token-major top-k slots.) Tj ET
+BT /F1 10.60 Tf 48.00 210.89 Td (After compaction, the first compute stage evaluates W13 and applies SwiGLU within the same Triton) Tj ET
+BT /F1 10.60 Tf 48.00 197.89 Td (program. It loads FP8 hidden blocks and FP8 expert weights, multiplies both operands by their) Tj ET
+BT /F1 10.60 Tf 48.00 184.89 Td (128-element block scales, casts the dequantized operands to BF16 for tl.dot, accumulates in FP32,) Tj ET
+BT /F1 10.60 Tf 48.00 171.89 Td (and stores the intermediate activation as BF16. The second compute stage evaluates W2 on the) Tj ET
+BT /F1 10.60 Tf 48.00 158.89 Td (intermediate activation, multiplies by the stored routing weight, and scatters the result to the) Tj ET
+BT /F1 10.60 Tf 48.00 145.89 Td (original output row. For tokens with a single local expert contribution, the kernel performs a) Tj ET
+BT /F1 10.60 Tf 48.00 132.89 Td (direct store; for tokens with multiple local contributions, it uses relaxed atomic addition. This) Tj ET
+BT /F1 10.60 Tf 48.00 119.89 Td (distinction avoids BF16 atomics in the common single-local-contribution case.) Tj ET
+endstream
+endobj
+4 0 obj
+<< /Type /Page /Parent 9 0 R /MediaBox [0 0 595.276 841.890] /Resources << /Font << /F1 1 0 R /F2 2 0 R >> >> /Contents 3 0 R >>
+endobj
+5 0 obj
+<< /Length 5877 >>
+stream
+BT /F1 10.60 Tf 48.00 791.89 Td (Two execution regimes are used. For seq_len == 1 and for large batches, the host reads the 32 expert) Tj ET
+BT /F1 10.60 Tf 48.00 778.89 Td (counts once and constructs compact job lists containing only valid \(expert, row tile\) pairs, thereby) Tj ET
+BT /F1 10.60 Tf 48.00 765.89 Td (minimizing empty GEMM tiles. For small batches with 2 <= seq_len <= 128, execution remains entirely) Tj ET
+BT /F1 10.60 Tf 48.00 752.89 Td (on the GPU after routing. A fused prefix/scatter kernel computes the 32 offsets and compacts routed) Tj ET
+BT /F1 10.60 Tf 48.00 739.89 Td (slots using vector prefix sums; GEMM1 and GEMM2 then use dense expert grids with in-kernel count) Tj ET
+BT /F1 10.60 Tf 48.00 726.89 Td (checks. This regime trades a limited number of empty tile launches for the removal of CPU) Tj ET
+BT /F1 10.60 Tf 48.00 713.89 Td (synchronization, which is the more important cost at short sequence lengths.) Tj ET
+BT /F2 12.20 Tf 48.00 688.89 Td (3. Routing and Compaction) Tj ET
+BT /F1 10.60 Tf 48.00 669.89 Td (Routing is performed by one Triton program per token. The program loads all 256 logits and biases,) Tj ET
+BT /F1 10.60 Tf 48.00 656.89 Td (computes sigmoid scores, performs group selection, and iteratively extracts the final top eight) Tj ET
+BT /F1 10.60 Tf 48.00 643.89 Td (experts. Small deterministic tie-breakers are added before selection to make equality cases stable.) Tj ET
+BT /F1 10.60 Tf 48.00 630.89 Td (During top-k extraction, the kernel writes the selected global expert id, stores the unbiased) Tj ET
+BT /F1 10.60 Tf 48.00 617.89 Td (sigmoid value for later normalization, increments the local expert count when the expert belongs to) Tj ET
+BT /F1 10.60 Tf 48.00 604.89 Td (this rank, and records the number of local hits for the token. The same kernel initializes the) Tj ET
+BT /F1 10.60 Tf 48.00 591.89 Td (output row to zero so that the later scatter phase can accumulate without requiring a separate) Tj ET
+BT /F1 10.60 Tf 48.00 578.89 Td (output fill kernel.) Tj ET
+BT /F1 10.60 Tf 48.00 561.89 Td (For the compact regime, a 32-element prefix-sum kernel computes the starting offset of each local) Tj ET
+BT /F1 10.60 Tf 48.00 548.89 Td (expert in the expert-major queue, and a scatter kernel uses per-expert atomic cursors to write) Tj ET
+BT /F1 10.60 Tf 48.00 535.89 Td (\(token_id, routing_weight\) pairs into their contiguous ranges. Since there are only 32 local) Tj ET
+BT /F1 10.60 Tf 48.00 522.89 Td (experts, the prefix sum is deliberately serial; its cost is small compared with the GEMM work, and) Tj ET
+BT /F1 10.60 Tf 48.00 509.89 Td (the resulting layout substantially simplifies downstream kernels.) Tj ET
+BT /F1 10.60 Tf 48.00 492.89 Td (For the small-batch regime, prefix-sum and scatter are fused. Each program owns one local expert,) Tj ET
+BT /F1 10.60 Tf 48.00 479.89 Td (computes its offset from the 32 counts, scans the T * 8 routing slots, and uses tl.cumsum to compact) Tj ET
+BT /F1 10.60 Tf 48.00 466.89 Td (hits for that expert. This removes both the host count transfer and the cursor-zeroing allocation) Tj ET
+BT /F1 10.60 Tf 48.00 453.89 Td (observed in the intermediate profile for tiny workloads.) Tj ET
+BT /F2 12.20 Tf 48.00 428.89 Td (4. FP8 Block-Scale GEMM Kernels) Tj ET
+BT /F1 10.60 Tf 48.00 409.89 Td (GEMM1 uses fixed tile parameters BLOCK_M = 128, BLOCK_N = 128, and BLOCK_K = 128, with eight warps) Tj ET
+BT /F1 10.60 Tf 48.00 396.89 Td (and three pipeline stages. The hidden dimension is therefore traversed in 56 K-tiles. The kernel) Tj ET
+BT /F1 10.60 Tf 48.00 383.89 Td (computes the gate and up projections in a single pass over the input row block: for each K-tile it) Tj ET
+BT /F1 10.60 Tf 48.00 370.89 Td (loads one hidden block and two W13 blocks, applies the hidden scale and the corresponding gate/up) Tj ET
+BT /F1 10.60 Tf 48.00 357.89 Td (weight scales, and accumulates two FP32 matrices. This reuses the hidden-state load and avoids) Tj ET
+BT /F1 10.60 Tf 48.00 344.89 Td (writing the 4096-dimensional W13 result to memory. The final operation is gate * silu\(up\), stored as) Tj ET
+BT /F1 10.60 Tf 48.00 331.89 Td (a 2048-dimensional BF16 intermediate.) Tj ET
+BT /F1 10.60 Tf 48.00 314.89 Td (GEMM2 uses BLOCK_N = 128 over the 7168 output dimension and BLOCK_K = 64 over the 2048 intermediate) Tj ET
+BT /F1 10.60 Tf 48.00 301.89 Td (dimension. BLOCK_M is selected from two manual configurations: 32 rows for small expert queues and) Tj ET
+BT /F1 10.60 Tf 48.00 288.89 Td (64 rows when the maximum expert count is at least 64. The larger M tile improves arithmetic density) Tj ET
+BT /F1 10.60 Tf 48.00 275.89 Td (for large queues, while the smaller tile reduces wasted work and register pressure for sparse) Tj ET
+BT /F1 10.60 Tf 48.00 262.89 Td (queues. The scale index along the output dimension is computed per column, which keeps the) Tj ET
+BT /F1 10.60 Tf 48.00 249.89 Td (implementation correct even when an N-tile crosses a 128-column scale-block boundary.) Tj ET
+BT /F1 10.60 Tf 48.00 232.89 Td (The design intentionally specializes to the fixed geometry of the MoE track. Constants such as the) Tj ET
+BT /F1 10.60 Tf 48.00 219.89 Td (number of experts, hidden size, intermediate size, top-k, and block size are compile-time constants) Tj ET
+BT /F1 10.60 Tf 48.00 206.89 Td (in the Triton kernels. This permits aggressive constant propagation and avoids run-time dispatch) Tj ET
+BT /F1 10.60 Tf 48.00 193.89 Td (overhead. The solution uses Triton tl.dot rather than handwritten CUDA and does not explicitly) Tj ET
+BT /F1 10.60 Tf 48.00 180.89 Td (invoke Blackwell-specific UMMA or TMA primitives. This choice prioritizes correctness, portability,) Tj ET
+BT /F1 10.60 Tf 48.00 167.89 Td (and predictable code generation in the evaluation environment for compute capability 10.0.) Tj ET
+BT /F2 12.20 Tf 48.00 142.89 Td (5. Performance Analysis) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 9 0 R /MediaBox [0 0 595.276 841.890] /Resources << /Font << /F1 1 0 R /F2 2 0 R >> >> /Contents 5 0 R >>
+endobj
+7 0 obj
+<< /Length 5168 >>
+stream
+BT /F1 10.60 Tf 48.00 791.89 Td (The Nsight Compute report corresponds to an intermediate revision, but it remains informative for) Tj ET
+BT /F1 10.60 Tf 48.00 778.89 Td (bottleneck diagnosis. The traced kernel time sums to approximately 553 microseconds. GEMM1 accounts) Tj ET
+BT /F1 10.60 Tf 48.00 765.89 Td (for 425.06 microseconds, or approximately 76.9 percent of the traced time. GEMM2 accounts for 81.76) Tj ET
+BT /F1 10.60 Tf 48.00 752.89 Td (microseconds, or approximately 14.8 percent. The remaining routing, prefix, scatter, fill, copy, and) Tj ET
+BT /F1 10.60 Tf 48.00 739.89 Td (reduction kernels account for about 46.2 microseconds, or 8.3 percent. Thus, the dominant absolute) Tj ET
+BT /F1 10.60 Tf 48.00 726.89 Td (cost is the first expert projection, while the dominant optimization opportunity for short sequences) Tj ET
+BT /F1 10.60 Tf 48.00 713.89 Td (is launch and synchronization overhead in auxiliary kernels.) Tj ET
+BT /F1 10.60 Tf 48.00 696.89 Td (The GEMM1 profile reports low achieved occupancy, approximately 8.14 percent, and high register) Tj ET
+BT /F1 10.60 Tf 48.00 683.89 Td (pressure, 168 registers per thread. It also reports only 1.12 waves per SM in that trace. These) Tj ET
+BT /F1 10.60 Tf 48.00 670.89 Td (numbers are consistent with a kernel that performs substantial in-kernel dequantization, maintains) Tj ET
+BT /F1 10.60 Tf 48.00 657.89 Td (two accumulators for gate and up projections, and evaluates a non-linear SwiGLU expression before) Tj ET
+BT /F1 10.60 Tf 48.00 644.89 Td (storing the intermediate. The design addresses the memory side by fusing gate/up computation and) Tj ET
+BT /F1 10.60 Tf 48.00 631.89 Td (activation, thereby avoiding a 4096-dimensional temporary per routed row. The remaining bottleneck) Tj ET
+BT /F1 10.60 Tf 48.00 618.89 Td (is primarily arithmetic density and register footprint within small per-expert row groups.) Tj ET
+BT /F1 10.60 Tf 48.00 601.89 Td (GEMM2 exhibits a different profile: 81.76 microseconds, 26.61 percent memory throughput, 18.79) Tj ET
+BT /F1 10.60 Tf 48.00 588.89 Td (percent SM throughput, 126 registers per thread, and 9.99 percent achieved occupancy. Its cost is) Tj ET
+BT /F1 10.60 Tf 48.00 575.89 Td (shaped not only by matmul but also by the scatter back to token-major output rows. The final design) Tj ET
+BT /F1 10.60 Tf 48.00 562.89 Td (reduces unnecessary atomic traffic by storing directly when a token has only one local expert) Tj ET
+BT /F1 10.60 Tf 48.00 549.89 Td (contribution and reserving relaxed atomics for true multi-local accumulation. This optimization is) Tj ET
+BT /F1 10.60 Tf 48.00 536.89 Td (particularly relevant because a token selects eight global experts but often maps to only a small) Tj ET
+BT /F1 10.60 Tf 48.00 523.89 Td (number of experts on a single expert-parallel rank.) Tj ET
+BT /F1 10.60 Tf 48.00 506.89 Td (The auxiliary kernels in the report are small and under-occupy the device by construction. For) Tj ET
+BT /F1 10.60 Tf 48.00 493.89 Td (example, routing, prefix sum, and local scatter appear as single-grid or near-single-grid launches) Tj ET
+BT /F1 10.60 Tf 48.00 480.89 Td (with durations on the order of 5 to 13 microseconds. The final small-batch regime follows directly) Tj ET
+BT /F1 10.60 Tf 48.00 467.89 Td (from this profile: it removes counts.cpu\(\) synchronization, fuses prefix and scatter, and uses dense) Tj ET
+BT /F1 10.60 Tf 48.00 454.89 Td (GEMM grids with early returns. For large batches, however, host-planned compact job lists remain) Tj ET
+BT /F1 10.60 Tf 48.00 441.89 Td (preferable because they eliminate empty expert row tiles and keep GEMM work proportional to actual) Tj ET
+BT /F1 10.60 Tf 48.00 428.89 Td (local routing demand.) Tj ET
+BT /F2 12.20 Tf 48.00 403.89 Td (6. Tools and Implementation) Tj ET
+BT /F1 10.60 Tf 48.00 384.89 Td (The code is written in Python with PyTorch for the public entry point and Triton for all) Tj ET
+BT /F1 10.60 Tf 48.00 371.89 Td (performance-critical GPU kernels. PyTorch is used for tensor allocation, device normalization,) Tj ET
+BT /F1 10.60 Tf 48.00 358.89 Td (destination-passing-style output handling, and scalar conversion. Triton is used for routing,) Tj ET
+BT /F1 10.60 Tf 48.00 345.89 Td (compaction, FP8 block-scale dequantization, both GEMMs, activation fusion, and scatter accumulation.) Tj ET
+BT /F1 10.60 Tf 48.00 332.89 Td (Nsight Compute was used to inspect kernel duration, occupancy, register pressure, memory throughput,) Tj ET
+BT /F1 10.60 Tf 48.00 319.89 Td (and the relative cost of auxiliary launches.) Tj ET
+BT /F1 10.60 Tf 48.00 302.89 Td (In summary, the solution favors a small number of specialized kernels over a general grouped-GEMM) Tj ET
+BT /F1 10.60 Tf 48.00 289.89 Td (framework. This specialization is justified by the fixed geometry, fixed routing rule, and small) Tj ET
+BT /F1 10.60 Tf 48.00 276.89 Td (local expert count of the MoE track. The resulting execution keeps dequantization inside the GEMM) Tj ET
+BT /F1 10.60 Tf 48.00 263.89 Td (kernels, computes only local experts, avoids large intermediate materialization, and adapts its) Tj ET
+BT /F1 10.60 Tf 48.00 250.89 Td (strategy to the sequence-length regime.) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 9 0 R /MediaBox [0 0 595.276 841.890] /Resources << /Font << /F1 1 0 R /F2 2 0 R >> >> /Contents 7 0 R >>
+endobj
+9 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R] /Count 3 >>
+endobj
+10 0 obj
+<< /Type /Catalog /Pages 9 0 R >>
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000015 00000 n 
+0000000087 00000 n 
+0000000158 00000 n 
+0000006246 00000 n 
+0000006390 00000 n 
+0000012318 00000 n 
+0000012462 00000 n 
+0000017681 00000 n 
+0000017825 00000 n 
+0000017894 00000 n 
+trailer
+<< /Size 11 /Root 10 0 R >>
+startxref
+17944
+%%EOF
