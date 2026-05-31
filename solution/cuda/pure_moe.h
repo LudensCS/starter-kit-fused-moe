@@ -1,27 +1,11 @@
-#pragma once
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#ifndef MLSYS26_FUSED_MOE_PURE_MOE_H_
+#define MLSYS26_FUSED_MOE_PURE_MOE_H_
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-#include <stdint.h>
+#include <cuda_runtime.h>
 
-#define NUM_EXPERTS 256
-#define NUM_LOCAL_EXPERTS 32
-#define TOP_K 8
-#define TOP_K_GROUP 4
-#define HIDDEN_SIZE 7168
-#define INTERMEDIATE_SIZE 2048
-
-// GEMM1: 32 tiles per expert * 32 experts = 1024 blocks
-#define GEMM1_GRID_X 32
-#define GEMM1_GRID_Y NUM_LOCAL_EXPERTS
-
-// GEMM2: 112 tiles per expert * 32 experts = 3584 blocks
-#define GEMM2_GRID_SIZE 3584
-
-#define SMEM_PAD_K 72
-
-void launch_moe_pipeline(
+void launch_moe_pipeline_cuda(
     const float* routing_logits,
     const __nv_bfloat16* routing_bias,
     const __nv_fp8_e4m3* hidden_states,
@@ -40,6 +24,7 @@ void launch_moe_pipeline(
     int* expert_offsets,
     int* sorted_token_ids,
     float* sorted_weights,
-    __nv_bfloat16* intermediate_buffer, 
-    cudaStream_t stream
-);
+    __nv_bfloat16* intermediate_buffer,
+    cudaStream_t stream);
+
+#endif

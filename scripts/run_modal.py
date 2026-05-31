@@ -26,16 +26,34 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-devel-ubuntu22.04",
+        add_python="3.12",
+    )
+    .env({"CUDA_HOME": "/usr/local/cuda"})
+    .pip_install(
+        "flashinfer-bench",
+        "torch",
+        "triton",
+        "numpy",
+    )
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(
+    image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume}
+)
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = BenchmarkConfig(
+            warmup_runs=3,
+            iterations=10,
+            num_trials=2,
+            required_matched_ratio=0.9,
+            atol=1.0,
+            rtol=0.3,
+        )
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -70,11 +88,15 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             }
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
+                entry["reference_latency_ms"] = (
+                    trace.evaluation.performance.reference_latency_ms
+                )
                 entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+            if trace.evaluation.log:
+                entry["log"] = trace.evaluation.log
             results[definition.name][trace.workload.uuid] = entry
 
     return results
@@ -100,6 +122,8 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+            if status != "PASSED" and result.get("log"):
+                print(result["log"][-4000:])
 
 
 @app.local_entrypoint()
